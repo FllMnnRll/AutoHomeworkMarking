@@ -1,13 +1,28 @@
 import fetch from "node-fetch";
+import fs from "fs";
+import path from "path";
 
-async function testEndpoint(url: string) {
+function loadEnv() {
+  const envPath = path.join(__dirname, "../.env");
+  if (!fs.existsSync(envPath)) return;
+  fs.readFileSync(envPath, "utf-8").split("\n").forEach((line) => {
+    const parts = line.split("=");
+    if (parts.length >= 2) {
+      const key = parts[0].trim();
+      const val = parts.slice(1).join("=").trim().replace(/^"(.*)"$/, "$1");
+      if (!process.env[key]) process.env[key] = val;
+    }
+  });
+}
+
+async function testEndpoint(url: string, apiKey: string) {
   console.log(`\nTesting ${url} ...`);
   try {
     const res = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": "Bearer sk-cp-VTPlWD8VCOZi-JZiBPhHespgd-AbnfonjbIk0knAAChMH7Ss010Gc-bJ9QWbu-_Y4noXZu6sR528b3chuTLAJ6E_Xb7pdFvWwQg1NlShH1GsWMFzLBh937I"
+        "Authorization": `Bearer ${apiKey}`
       },
       body: JSON.stringify({
         model: "MiniMax-Text-01",
@@ -24,9 +39,17 @@ async function testEndpoint(url: string) {
 }
 
 async function run() {
-  await testEndpoint("https://api.minimaxi.com/v1/chat/completions");
-  await testEndpoint("https://api.minimax.chat/v1/chat/completions");
-  await testEndpoint("https://api.minimax.io/v1/chat/completions");
+  loadEnv();
+  const { resolveSecret } = await import("../lib/secrets");
+  const apiKey = resolveSecret("MINIMAX_API_KEY");
+  if (!apiKey) {
+    console.error("MINIMAX_API_KEY not set in .env");
+    process.exit(1);
+  }
+
+  await testEndpoint("https://api.minimaxi.com/v1/chat/completions", apiKey);
+  await testEndpoint("https://api.minimax.chat/v1/chat/completions", apiKey);
+  await testEndpoint("https://api.minimax.io/v1/chat/completions", apiKey);
 }
 
 run();

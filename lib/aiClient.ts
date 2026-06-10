@@ -4,6 +4,7 @@ import https from "https";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import nodeFetch from "node-fetch";
 import net from "net";
+import { resolveSecret, resolveSecretList } from "@/lib/secrets";
 
 const COMMON_PROXY_PORTS = [7897, 7890, 7893, 10809, 1080];
 let hasActiveProxy = false;
@@ -73,10 +74,9 @@ const standardAgent = new https.Agent({
 // ==========================================
 export function getGeminiClients() {
   const keys: string[] = [];
-  if (process.env.GEMINI_API_KEY) keys.push(process.env.GEMINI_API_KEY);
-  if (process.env.GEMINI_API_KEYS) {
-    keys.push(...process.env.GEMINI_API_KEYS.split(',').map(k => k.trim()).filter(Boolean));
-  }
+  const primaryKey = resolveSecret("GEMINI_API_KEY");
+  if (primaryKey) keys.push(primaryKey);
+  keys.push(...resolveSecretList("GEMINI_API_KEYS"));
   const uniqueKeys = Array.from(new Set(keys));
   if (uniqueKeys.length === 0) return [new GoogleGenAI({})];
   return uniqueKeys.map(apiKey => new GoogleGenAI({ apiKey }));
@@ -128,7 +128,7 @@ let minimaxClient: OpenAI | null = null;
 async function getMinimaxClient() {
   if (minimaxClient) return minimaxClient;
   
-  const apiKey = process.env.MINIMAX_API_KEY;
+  const apiKey = resolveSecret("MINIMAX_API_KEY");
   if (!apiKey) {
     throw new Error("MINIMAX_API_KEY is not defined in the environment. Please add it to your .env file.");
   }
@@ -286,7 +286,7 @@ let deepseekClient: OpenAI | null = null;
 async function getDeepSeekClient() {
   if (deepseekClient) return deepseekClient;
   
-  const apiKey = process.env.DEEPSEEK_API_KEY;
+  const apiKey = resolveSecret("DEEPSEEK_API_KEY");
   if (!apiKey) {
     throw new Error("DEEPSEEK_API_KEY is not defined in the environment. Please add it to your .env file.");
   }

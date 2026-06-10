@@ -3,6 +3,7 @@ import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import { PrismaClient } from "@prisma/client";
 import { processHomeworkSlice } from "@/lib/gradingEngine";
+import { resolveSecret } from "@/lib/secrets";
 import fs from "fs";
 import path from "path";
 
@@ -19,8 +20,8 @@ export async function POST(req: NextRequest) {
 
     // Mocking email scan if IMAP_USER is not provided.
     // In a real environment, the user would configure these in .env
-    const user = process.env.IMAP_USER;
-    const pass = process.env.IMAP_PASS;
+    const user = resolveSecret("IMAP_USER");
+    const pass = resolveSecret("IMAP_PASS");
     const host = process.env.IMAP_HOST || "imap.gmail.com";
     const port = parseInt(process.env.IMAP_PORT || "993");
 
