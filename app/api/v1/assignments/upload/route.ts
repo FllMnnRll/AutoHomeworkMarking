@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { PrismaClient } from "@prisma/client";
-import { processHomeworkSlice } from "@/lib/gradingEngine";
 import fs from "fs";
 import path from "path";
+import { isOversizedBuffer } from "@/lib/pdfChunking";
 
 const prisma = new PrismaClient();
 
@@ -44,10 +44,19 @@ export async function POST(req: NextRequest) {
       }
     });
 
+    const fileSizeMb = buffer.length / (1024 * 1024);
+    const isPdf = file.name.toLowerCase().endsWith(".pdf") || file.type === "application/pdf";
+    const pdfChunked = isPdf && isOversizedBuffer(buffer);
+
     return NextResponse.json({ 
       status: "success",
       message: "File ingested and queued for AI Math-Vision processing.",
       jobId: submission.id,
+      pdfChunked,
+      fileSizeMb: Math.round(fileSizeMb * 10) / 10,
+      chunkWarning: pdfChunked
+        ? `Large PDF (${fileSizeMb.toFixed(1)} MB > 10 MB). Will be split at page boundaries and processed with parallel workers during grading.`
+        : null,
     }, { status: 202 });
 
   } catch (error) {

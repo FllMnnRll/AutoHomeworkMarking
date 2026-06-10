@@ -1,6 +1,7 @@
 import React from 'react';
 import Link from 'next/link';
-import { Search, CheckCircle2, AlertTriangle, FileText } from 'lucide-react';
+import { Search, CheckCircle2, AlertTriangle, FileText, Layers } from 'lucide-react';
+import { parseProcessingMeta } from '@/lib/pdfChunking';
 import { PrismaClient } from '@prisma/client';
 import UploadModal from './UploadModal';
 import RetryButton from './RetryButton';
@@ -54,6 +55,7 @@ export default async function ResultsPage({ searchParams }: { searchParams: Prom
   return (
     <div className="max-w-6xl mx-auto w-full space-y-6">
       <GradingController 
+        assignmentId={activeAssignment?.id}
         pendingCount={submissions.filter(sub => sub.status === 'Processing OCR' || sub.status === 'Queued').length}
         completedCount={completedSubmissions}
         totalCount={totalSubmissions}
@@ -146,9 +148,26 @@ export default async function ResultsPage({ searchParams }: { searchParams: Prom
                           <AlertTriangle className="w-3.5 h-3.5" /> Needs Review
                         </span>
                       ) : sub.status === 'Processing OCR' ? (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-indigo-100 text-indigo-600 text-xs font-bold">
-                          <div className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse"></div> Processing
-                        </span>
+                        (() => {
+                          const meta = parseProcessingMeta(sub.processingMeta);
+                          if (meta?.pdfChunked) {
+                            return (
+                              <div className="flex flex-col gap-1">
+                                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-amber-100 text-amber-800 text-xs font-bold w-fit">
+                                  <Layers className="w-3.5 h-3.5" /> Chunk {meta.completedChunks}/{meta.totalChunks}
+                                </span>
+                                <span className="text-[10px] text-amber-600 font-semibold max-w-[200px] leading-tight" title={meta.message}>
+                                  {meta.phase}: {meta.message}
+                                </span>
+                              </div>
+                            );
+                          }
+                          return (
+                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-indigo-100 text-indigo-600 text-xs font-bold">
+                              <div className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse"></div> Processing
+                            </span>
+                          );
+                        })()
                       ) : sub.status === 'Queued' ? (
                         <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-100 text-slate-500 text-xs font-bold">
                           <div className="w-1.5 h-1.5 rounded-full bg-slate-300"></div> Queued

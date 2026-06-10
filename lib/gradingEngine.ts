@@ -1,9 +1,15 @@
 import { PrismaClient } from '@prisma/client';
 import fs from 'fs';
 import path from 'path';
-import { generateContentWithFallback, generateReasoning } from './aiClient';
+import { generateContentWithFallback } from './aiClient';
 import { PDFDocument } from 'pdf-lib';
 import crypto from 'crypto';
+import { isOversizedPdf, getFileSizeMb } from './pdfChunking';
+import {
+  runChunkedParallelOcr,
+  runChunkedParallelReasoning,
+  clearSubmissionMeta,
+} from './chunkedGrading';
 
 const prisma = new PrismaClient();
 
@@ -141,6 +147,26 @@ export async function getPagesFromFile(filePath: string, ext: string): Promise<{
   }];
 }
 
+async function ocrAllPages(
+  submissionId: string,
+  pages: { base64Data: string; mimeType: string; pageNumber: number }[],
+  buildPrompt: (page: { base64Data: string; mimeType: string; pageNumber: number }) => string,
+  contextPrefix: string,
+  pdfChunked: boolean,
+  fileSizeMb: number
+): Promise<string> {
+  const transcripts = await runChunkedParallelOcr(
+    submissionId,
+    pages,
+    buildPrompt,
+    contextPrefix,
+    pdfChunked,
+    fileSizeMb,
+    getOrTranscribePage
+  );
+  return transcripts.join("\n\n");
+}
+
 /**
  * Processes a homework slice using a 2-Stage Pipeline:
  * Stage 1: Gemini (Vision OCR -> Markdown)
@@ -163,6 +189,12 @@ export async function processHomeworkSlice(submissionId: string, imagePath: stri
     
     // Get all individual pages
     const pages = await getPagesFromFile(fullPath, ext);
+    const pdfChunked = isOversizedPdf(fullPath, ext);
+    const fileSizeMb = ext === ".pdf" ? getFileSizeMb(fullPath) : 0;
+
+    if (pdfChunked) {
+      console.log(`[GradingEngine] Large PDF detected (${fileSizeMb.toFixed(1)} MB > 10 MB). Enabling page-boundary chunk parallel processing.`);
+    }
 
     // ==========================================
     // CACHING ARCHITECTURE SETUP
@@ -190,24 +222,19 @@ export async function processHomeworkSlice(submissionId: string, imagePath: stri
       console.log(`[GradingEngine] Phase A: No cached key. Running Full Parallel OCR on ${pages.length} pages & Generating Master Answer Key...`);
       
       const geminiStartTime = Date.now();
-      const pageTranscripts = await Promise.all(
-        pages.map(async (page) => {
-          const prompt = `You are an expert Math/Physics transcription assistant.
+      transcribedMarkdown = await ocrAllPages(
+        submissionId,
+        pages,
+        (page) => `You are an expert Math/Physics transcription assistant.
 This is Page ${page.pageNumber} of a student's handwritten homework submission.
 Your SOLE job is to transcribe EVERYTHING you see on this page into clean, structured Markdown.
 - Transcribe all text, numbers, formulas, and diagrams exactly as written.
 - Wrap ALL math in LaTeX block ($$ ... $$) or inline ($ ... $).
-- DO NOT solve the problems. DO NOT grade the problems. Just TRANSCRIBE.`;
-          const text = await getOrTranscribePage(
-            page.base64Data,
-            page.mimeType,
-            prompt,
-            `GradingEngine: Phase A Full OCR Page ${page.pageNumber}`
-          );
-          return `## Page ${page.pageNumber}\n\n${text}`;
-        })
+- DO NOT solve the problems. DO NOT grade the problems. Just TRANSCRIBE.`,
+        "GradingEngine: Phase A Full OCR",
+        pdfChunked,
+        fileSizeMb
       );
-      transcribedMarkdown = pageTranscripts.join("\n\n");
 
       // If AnswerKey mode is selected, attach and transcribe the answer key file
       if (assignment.aiMode === "AnswerKey" && assignment.answerKeyPath) {
@@ -216,30 +243,29 @@ Your SOLE job is to transcribe EVERYTHING you see on this page into clean, struc
           console.log("[GradingEngine] Transcribing Answer Key...");
           const akExt = path.extname(akFullPath).toLowerCase();
           const akPages = await getPagesFromFile(akFullPath, akExt);
-          const akTranscripts = await Promise.all(
-            akPages.map(async (akPage) => {
-              const isHomework = assignment.evaluationType === "Homework";
-              const prompt = isHomework
-                ? `You are an expert Math/Physics transcription assistant.
+          const akChunked = isOversizedPdf(akFullPath, akExt);
+          const akSizeMb = akExt === ".pdf" ? getFileSizeMb(akFullPath) : 0;
+          const isHomework = assignment.evaluationType === "Homework";
+          const akTranscripts = await runChunkedParallelOcr(
+            submissionId,
+            akPages,
+            (akPage) => isHomework
+              ? `You are an expert Math/Physics transcription assistant.
 This is Page ${akPage.pageNumber} of the Answer Key.
 Your SOLE job is to transcribe ONLY the correct question numbers and their final correct answers (e.g. option letters like 'A', 'B', or short final values like 'x = 5').
 DO NOT transcribe verbose step-by-step solutions, explanations, derivations, or long descriptions. 
 Skip all detailed solving steps entirely to make it extremely compact.`
-                : `You are an expert Math/Physics transcription assistant.
+              : `You are an expert Math/Physics transcription assistant.
 This is Page ${akPage.pageNumber} of the Answer Key.
 Your SOLE job is to transcribe EVERYTHING you see on this page into clean, structured Markdown.
 Wrap ALL math in LaTeX block ($$ ... $$) or inline ($ ... $).
-DO NOT solve the problems. Just TRANSCRIBE.`;
-              const text = await getOrTranscribePage(
-                akPage.base64Data,
-                akPage.mimeType,
-                prompt,
-                `GradingEngine: Answer Key OCR Page ${akPage.pageNumber}`
-              );
-              return `### Answer Key Page ${akPage.pageNumber}\n\n${text}`;
-            })
+DO NOT solve the problems. Just TRANSCRIBE.`,
+            "GradingEngine: Answer Key OCR",
+            akChunked,
+            akSizeMb,
+            getOrTranscribePage
           );
-          transcribedMarkdown += `\n\n# ANSWER KEY\n\n${akTranscripts.join("\n\n")}`;
+          transcribedMarkdown += `\n\n# ANSWER KEY\n\n${akTranscripts.map((t) => t.replace(/^## Page (\d+)/, "### Answer Key Page $1")).join("\n\n")}`;
         }
       }
       
@@ -259,48 +285,42 @@ DO NOT solve the problems. Just TRANSCRIBE.`;
         console.log(`[GradingEngine] Phase B: Cache hit. Running Cross-Validation check (Full Parallel OCR)...`);
         
         const geminiStartTime = Date.now();
-        const pageTranscripts = await Promise.all(
-          pages.map(async (page) => {
-            const prompt = `You are an expert Math/Physics transcription assistant.
+        transcribedMarkdown = await ocrAllPages(
+          submissionId,
+          pages,
+          (page) => `You are an expert Math/Physics transcription assistant.
 This is Page ${page.pageNumber} of a student's handwritten homework submission.
 Your SOLE job is to transcribe EVERYTHING you see on this page into clean, structured Markdown.
 - Transcribe all text, numbers, formulas, and diagrams exactly as written.
 - Wrap ALL math in LaTeX block ($$ ... $$) or inline ($ ... $).
-- DO NOT solve the problems. DO NOT grade the problems. Just TRANSCRIBE.`;
-            const text = await getOrTranscribePage(
-              page.base64Data,
-              page.mimeType,
-              prompt,
-              `GradingEngine: Cross-Val OCR Page ${page.pageNumber}`
-            );
-            return `## Page ${page.pageNumber}\n\n${text}`;
-          })
+- DO NOT solve the problems. DO NOT grade the problems. Just TRANSCRIBE.`,
+          "GradingEngine: Cross-Val OCR",
+          pdfChunked,
+          fileSizeMb
         );
-        transcribedMarkdown = pageTranscripts.join("\n\n");
         console.log(`[GradingEngine] Cross-Val OCR complete in ${((Date.now() - geminiStartTime) / 1000).toFixed(1)}s`);
       } else {
         console.log(`[GradingEngine] Phase B: Cache hit. Running Targeted Parallel OCR...`);
         isTargetedOcr = true;
 
         const geminiStartTime = Date.now();
-        const pageTranscripts = await Promise.all(
-          pages.map(async (page) => {
+        transcribedMarkdown = await ocrAllPages(
+          submissionId,
+          pages,
+          (page) => {
             const pageQs = solvedAnswerKey.filter(q => {
               const pNums = q.pageNumbers || (q.pageNumber ? [q.pageNumber] : [1]);
               return pNums.includes(page.pageNumber);
             });
-            
-            let ocrPrompt = "";
             if (pageQs.length === 0) {
-              ocrPrompt = `You are an expert Math/Physics transcription assistant.
+              return `You are an expert Math/Physics transcription assistant.
 Attached is Page ${page.pageNumber} of a student's handwritten homework submission.
 Your job is to transcribe any handwritten text or formulas you see on this page.
 If there are no answers or homework content, output: "No student work on this page".`;
-            } else {
-              const masterQuestionsList = pageQs.map(q => `${q.questionNumber} (${q.type})`).join(", ");
-              
-              if (assignment.gradingDepth === "Fast" || assignment.evaluationType === "Homework") {
-                ocrPrompt = `You are an expert Math/Physics transcription assistant.
+            }
+            const masterQuestionsList = pageQs.map(q => `${q.questionNumber} (${q.type})`).join(", ");
+            if (assignment.gradingDepth === "Fast" || assignment.evaluationType === "Homework") {
+              return `You are an expert Math/Physics transcription assistant.
 Attached is Page ${page.pageNumber} of a student's handwritten homework submission.
 
 We already know the questions on this page are: [${masterQuestionsList}].
@@ -312,8 +332,8 @@ Student's final answer: [final chosen option or numerical answer]
 
 DO NOT transcribe the question texts. DO NOT transcribe their intermediate derivation steps or working process. Just give the final answer.
 Wrap all math formulas in LaTeX ($ ... $ or $$ ... $$).`;
-              } else {
-                ocrPrompt = `You are an expert Math/Physics transcription assistant.
+            }
+            return `You are an expert Math/Physics transcription assistant.
 Attached is Page ${page.pageNumber} of a student's handwritten homework submission.
 
 We already know the questions on this page are: [${masterQuestionsList}].
@@ -325,20 +345,11 @@ Student's handwritten answer/work: [handwritten steps and final chosen answer]
 
 DO NOT transcribe the question texts. Just transcribe the student's own work and answer.
 Wrap all math formulas in LaTeX ($ ... $ or $$ ... $$).`;
-              }
-            }
-
-            const text = await getOrTranscribePage(
-              page.base64Data,
-              page.mimeType,
-              ocrPrompt,
-              `GradingEngine: Targeted OCR Page ${page.pageNumber}`
-            );
-
-            return `## Page ${page.pageNumber}\n\n${text}`;
-          })
+          },
+          "GradingEngine: Targeted OCR",
+          pdfChunked,
+          fileSizeMb
         );
-        transcribedMarkdown = pageTranscripts.join("\n\n");
         console.log(`[GradingEngine] Targeted Parallel OCR complete in ${((Date.now() - geminiStartTime) / 1000).toFixed(1)}s`);
       }
     }
@@ -363,172 +374,101 @@ Wrap all math formulas in LaTeX ($ ... $ or $$ ... $$).`;
          This is a REASONING / EXAM evaluation: Meticulously evaluate the student's step-by-step derivations, formulas, and working steps. Apply Error Carried Forward (ECF) and award partial credit strictly based on the steps.`;
     }
 
-    let dsResultRaw = "";
-    let deepSeekSystemPrompt = "";
     const dsStartTime = Date.now();
+    let buildSystemPrompt: (chunkMarkdown: string, chunkLabel: string) => string;
 
     if (!hasCachedKey) {
-      // First Submission: Solves & compiles standard answer key using deepseek-v4-flash (no thinking)
       console.log(`[GradingEngine] Running deepseek-v4-flash (no thinking) to compile Master Key...`);
-      
-      deepSeekSystemPrompt = `
+      buildSystemPrompt = (_chunkMd, chunkLabel) => `
         You are an elite ${assignment.subject} grading assistant.
         ${subjectPrompt}
         ${modePrompt}
         
-        You will be provided with a raw Markdown transcription of a student's homework, divided into sections by page headers (e.g. ## Page 1, ## Page 2).
-        Your task is to grade it step-by-step.
+        You are processing ${chunkLabel} of a student's homework transcription (Markdown with ## Page headers).
+        Grade ONLY the questions found in this section.
         
-        Since this is the first submission for this assignment, you MUST also compile a Master Answer Key.
-        For each question found in the student homework (or answer key), you MUST solve it to get the correct standard steps and standard correct answer.
-        You MUST also identify which pages the question is located on (from the ## Page [X] headers). If a question's text or student work spans multiple pages, list all of them.
+        Since this is the first submission for this assignment, you MUST also compile a Master Answer Key for questions in this section.
+        For each question found, you MUST solve it to get the correct standard steps and standard correct answer.
+        You MUST identify which pages the question is located on (from the ## Page [X] headers).
         
-        CRITICAL LATENCY DIRECTIVE: Keep the "gradingLogic" field extremely brief and concise (MUST be under 15 words, e.g. "Solved x = 5 correctly" or "Selected option B, correct").
-        
-        CRITICAL JSON FORMATTING RULES:
-        1. DO NOT include any LaTeX backslashes (\\), mathematical formatting, or formulas inside the "gradingLogic" or "pointsAwarded" or "status" fields. Use plain text characters only.
-        2. Double-escape any necessary JSON quotes or characters inside strings.
-        
-        CRITICAL JSON REQUIREMENT:
-        You MUST output a valid JSON object matching exactly this schema (and nothing else):
-        {
-          "pipeline": [
-            {
-              "questionNumber": "String (e.g. '1', '2a')",
-              "pageNumbers": [Integer] (An array of page indexes where this question was found, 1-indexed, e.g. [1] or [1, 2] if it spans multiple pages),
-              "type": "String ('MCQ' or 'FRQ')",
-              "ocrQuestionText": "String (The question text itself)",
-              "ocrStudentWork": "String (The student's steps/answer)",
-              "gradingLogic": "String (Your detailed step-by-step reasoning, EXTREMELY CONCISE, under 15 words)",
-              "status": "String ('correct', 'error', or 'ecf')",
-              "pointsAwarded": "String",
-              "standardAnswer": "String (The correct standard answer, e.g., 'B' or 'x = 5')",
-              "standardSteps": "String (The step-by-step derivation/solving steps)"
-            }
-          ],
-          "totalScore": Integer (0 to 100 representing the overall percentage correctness)
-        }
-        
-        All LaTeX backslashes inside strings MUST be double-escaped for JSON (e.g. \\\\frac).
-      `;
-
-      dsResultRaw = (await generateReasoning(deepSeekSystemPrompt, transcribedMarkdown, true, "deepseek-v4-flash", false)) || "";
-    } else if (isCrossValidation) {
-      // Subsequent Cross-Validation path: Grades and cross-checks for new questions via deepseek-v4-flash
-      console.log(`[GradingEngine] Running deepseek-v4-flash (no thinking) for cross-validation grading...`);
-
-      deepSeekSystemPrompt = `
-        You are an elite ${assignment.subject} grading assistant.
-        You are performing comparative grading and cross-validation against a cached Answer Key.
-        
-        Here is the cached master Answer Key containing standard correct answers and steps:
-        ${JSON.stringify(solvedAnswerKey, null, 2)}
-        
-        And here is the student's full transcribed homework:
-        ${transcribedMarkdown}
-        
-        Your task is two-fold:
-        1. Grade the student's work step-by-step against the master Answer Key.
-        2. CRITICAL CROSS-VALIDATION: Check if there are any questions in the student's homework that are NOT in the master Answer Key. If you find any new/different questions:
-           - Solve them to get the correct standard steps and standard correct answer.
-           - Identify which pages they are located on.
-           - Grade the student's work for those questions as well.
-           - Output these new solved questions in a special "newQuestions" array in your JSON response.
-        
-        CRITICAL LATENCY DIRECTIVE: Keep the "gradingLogic" field extremely brief and concise (MUST be under 15 words, e.g. "Solved x = 5 correctly" or "Selected option B, correct").
+        CRITICAL LATENCY DIRECTIVE: Keep the "gradingLogic" field extremely brief and concise (MUST be under 15 words).
         
         CRITICAL JSON FORMATTING RULES:
-        1. DO NOT include any LaTeX backslashes (\\), mathematical formatting, or formulas inside the "gradingLogic" or "pointsAwarded" or "status" fields. Use plain text characters only.
+        1. DO NOT include any LaTeX backslashes (\\), mathematical formatting, or formulas inside the "gradingLogic" or "pointsAwarded" or "status" fields.
         2. Double-escape any necessary JSON quotes or characters inside strings.
         
         You MUST output a valid JSON object matching exactly this schema (and nothing else):
         {
           "pipeline": [
-            {
-              "questionNumber": "String (e.g. '1', '2a')",
-              "type": "String ('MCQ' or 'FRQ')",
-              "ocrQuestionText": "String (The question text)",
-              "ocrStudentWork": "String (The student's steps/answer)",
-              "gradingLogic": "String (Your detailed step-by-step grading explanation, EXTREMELY CONCISE, under 15 words)",
-              "status": "String ('correct', 'error', or 'ecf')",
-              "pointsAwarded": "String"
-            }
-          ],
-          "totalScore": Integer (0 to 100),
-          "newQuestions": [
             {
               "questionNumber": "String",
-              "pageNumbers": [Integer] (An array of page indexes where the question was found, 1-indexed, e.g. [1] or [1, 2]),
-              "type": "String",
+              "pageNumbers": [Integer],
+              "type": "String ('MCQ' or 'FRQ')",
               "ocrQuestionText": "String",
+              "ocrStudentWork": "String",
+              "gradingLogic": "String (under 15 words)",
+              "status": "String ('correct', 'error', or 'ecf')",
+              "pointsAwarded": "String",
               "standardAnswer": "String",
               "standardSteps": "String"
             }
-          ]
-        }
-      `;
-
-      dsResultRaw = (await generateReasoning(deepSeekSystemPrompt, transcribedMarkdown, true, "deepseek-v4-flash", false)) || "";
-    } else {
-      // Subsequent Standard path: Fast comparative grading via deepseek-v4-flash
-      console.log(`[GradingEngine] Running ultra-fast deepseek-v4-flash (no thinking) for comparative grading...`);
-
-      deepSeekSystemPrompt = `
-        You are an elite ${assignment.subject} grading assistant.
-        You are performing ultra-fast cached comparative grading.
-        
-        Here is the cached master Answer Key containing standard correct answers and steps:
-        ${JSON.stringify(solvedAnswerKey, null, 2)}
-        
-        And here is the student's transcribed work/answers:
-        ${transcribedMarkdown}
-        
-        Grade the student's work step-by-step by comparing it directly to the master Answer Key.
-        - Use the master answers and steps as the ground truth.
-        - Check if the student's final answer is correct.
-        - Evaluate their steps against the master steps.
-        - Apply Error Carried Forward (ECF) where appropriate.
-        - For MCQ questions, strictly compare their chosen letter against the correct option letter.
-        
-        CRITICAL LATENCY DIRECTIVE: Keep the "gradingLogic" field extremely brief and concise (MUST be under 15 words, e.g. "Solved x = 5 correctly" or "Selected option B, correct").
-        
-        CRITICAL JSON FORMATTING RULES:
-        1. DO NOT include any LaTeX backslashes (\\), mathematical formatting, or formulas inside the "gradingLogic" or "pointsAwarded" or "status" fields. Use plain text characters only.
-        2. Double-escape any necessary JSON quotes or characters inside strings.
-        
-        You MUST output a valid JSON object matching exactly this schema (and nothing else):
-        {
-          "pipeline": [
-            {
-              "questionNumber": "String (e.g. '1', '2a')",
-              "type": "String ('MCQ' or 'FRQ')",
-              "ocrQuestionText": "String (The question text itself from the master Answer Key)",
-              "ocrStudentWork": "String (The student's steps/answer)",
-              "gradingLogic": "String (Your detailed step-by-step grading explanation, EXTREMELY CONCISE, under 15 words)",
-              "status": "String ('correct', 'error', or 'ecf')",
-              "pointsAwarded": "String"
-            }
           ],
-          "totalScore": Integer (0 to 100 representing the overall percentage correctness)
+          "totalScore": Integer (0 to 100)
         }
       `;
-
-      dsResultRaw = (await generateReasoning(deepSeekSystemPrompt, transcribedMarkdown, true, "deepseek-v4-flash", false)) || "";
+    } else if (isCrossValidation) {
+      console.log(`[GradingEngine] Running deepseek-v4-flash (no thinking) for cross-validation grading...`);
+      buildSystemPrompt = (_chunkMd, chunkLabel) => `
+        You are an elite ${assignment.subject} grading assistant performing cross-validation grading for ${chunkLabel}.
+        
+        Cached master Answer Key:
+        ${JSON.stringify(solvedAnswerKey)}
+        
+        The student's transcribed homework for this section is in the user message.
+        
+        1. Grade the student's work against the master Answer Key.
+        2. If new questions appear that are NOT in the master key, solve them and output in "newQuestions".
+        
+        CRITICAL LATENCY DIRECTIVE: Keep "gradingLogic" under 15 words.
+        
+        Output valid JSON:
+        {
+          "pipeline": [{ "questionNumber": "String", "type": "String", "ocrQuestionText": "String", "ocrStudentWork": "String", "gradingLogic": "String", "status": "String", "pointsAwarded": "String" }],
+          "totalScore": Integer,
+          "newQuestions": [{ "questionNumber": "String", "pageNumbers": [Integer], "type": "String", "ocrQuestionText": "String", "standardAnswer": "String", "standardSteps": "String" }]
+        }
+      `;
+    } else {
+      console.log(`[GradingEngine] Running ultra-fast deepseek-v4-flash (no thinking) for comparative grading...`);
+      buildSystemPrompt = (_chunkMd, chunkLabel) => `
+        You are an elite ${assignment.subject} grading assistant performing cached comparative grading for ${chunkLabel}.
+        
+        Cached master Answer Key:
+        ${JSON.stringify(solvedAnswerKey)}
+        
+        The student's transcribed work for this section is in the user message.
+        Grade step-by-step against the master Answer Key. Apply ECF where appropriate.
+        
+        CRITICAL LATENCY DIRECTIVE: Keep "gradingLogic" under 15 words.
+        
+        Output valid JSON:
+        {
+          "pipeline": [{ "questionNumber": "String", "type": "String", "ocrQuestionText": "String", "ocrStudentWork": "String", "gradingLogic": "String", "status": "String", "pointsAwarded": "String" }],
+          "totalScore": Integer (0 to 100)
+        }
+      `;
     }
 
-    if (!dsResultRaw) throw new Error("Empty reasoning response from DeepSeek API");
+    const aiResult = await runChunkedParallelReasoning(
+      submissionId,
+      transcribedMarkdown,
+      buildSystemPrompt,
+      pdfChunked,
+      fileSizeMb,
+      pages.length
+    );
+
     console.log(`[GradingEngine] DeepSeek complete in ${((Date.now() - dsStartTime) / 1000).toFixed(1)}s`);
-
-    // Clean up reasoning <think> tags and markdown before parsing
-    let cleanJson = dsResultRaw.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-    cleanJson = cleanJson.replace(/```(?:json)?/g, '').replace(/```/g, '').trim();
-    const firstBrace = cleanJson.indexOf('{');
-    const lastBrace = cleanJson.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace !== -1) {
-      cleanJson = cleanJson.slice(firstBrace, lastBrace + 1);
-    }
-    
-    const aiResult = JSON.parse(cleanJson);
 
     console.log(`[GradingEngine] Pipeline Complete. aiResult keys:`, Object.keys(aiResult));
     console.log(`[GradingEngine] totalScore:`, aiResult.totalScore, `pipeline length:`, aiResult.pipeline?.length);
@@ -609,6 +549,7 @@ Wrap all math formulas in LaTeX ($ ... $ or $$ ... $$).`;
       throw dbErr;
     }
 
+    await clearSubmissionMeta(submissionId);
     return { success: true, aiResult };
 
   } catch (error: any) {

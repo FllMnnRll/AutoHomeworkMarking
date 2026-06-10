@@ -1,7 +1,9 @@
 "use client";
 
 import React, { useState, useRef, useEffect } from "react";
-import { Upload, X, Loader2, CheckCircle2, FileStack, User, AlertCircle } from "lucide-react";
+import { Upload, X, Loader2, CheckCircle2, FileStack, User, AlertCircle, Layers } from "lucide-react";
+
+const PDF_MAX_BYTES = 10 * 1024 * 1024;
 import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 
@@ -35,8 +37,12 @@ export default function UploadModal({
   const [tempFileName, setTempFileName] = useState("");
   const [matched, setMatched] = useState<{studentId: string, studentName: string, startPage: number, endPage: number}[]>([]);
   const [unmatched, setUnmatched] = useState<{startPage: number, endPage: number, assignedStudentId?: string}[]>([]);
+  const [batchChunkMessage, setBatchChunkMessage] = useState<string | null>(null);
 
   const [mounted, setMounted] = useState(false);
+
+  const isLargePdf = file && (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) && file.size > PDF_MAX_BYTES;
+  const fileSizeMb = file ? (file.size / (1024 * 1024)).toFixed(1) : null;
   const fileInputRef = useRef<HTMLInputElement>(null);
   const router = useRouter();
 
@@ -80,6 +86,7 @@ export default function UploadModal({
     setIsUploading(false);
     setMatched([]);
     setUnmatched([]);
+    setBatchChunkMessage(null);
   };
 
   const handleClose = () => {
@@ -101,6 +108,10 @@ export default function UploadModal({
         body: formData
       });
       if (res.ok) {
+        const data = await res.json();
+        if (data.chunkWarning) {
+          alert(data.chunkWarning);
+        }
         setSuccess(true);
         setTimeout(() => {
           handleClose();
@@ -135,6 +146,7 @@ export default function UploadModal({
         setTempFileName(data.tempFileName);
         setMatched(data.matched);
         setUnmatched(data.unmatched);
+        setBatchChunkMessage(data.chunkMessage || null);
         setMode("Confirm");
       } else {
         alert("Analysis failed: " + data.error);
@@ -266,6 +278,18 @@ export default function UploadModal({
         </div>
       </div>
 
+      {isLargePdf && (
+        <div className="flex items-start gap-2.5 p-3.5 bg-amber-50 border border-amber-200 rounded-xl">
+          <Layers className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+          <div className="text-xs">
+            <p className="font-bold text-amber-800">Large PDF Detected ({fileSizeMb} MB &gt; 10 MB)</p>
+            <p className="text-amber-700 font-medium mt-0.5 leading-relaxed">
+              This file will be split at page boundaries during grading. Each chunk resumes from the breakpoint page and is processed in parallel by multiple AI workers.
+            </p>
+          </div>
+        </div>
+      )}
+
       <button 
         onClick={activeTab === "Single" ? handleSingleUpload : handleBatchAnalyze}
         disabled={!file || isUploading}
@@ -290,6 +314,12 @@ export default function UploadModal({
       <div className="text-center">
         <h3 className="text-xl font-bold text-slate-800 mb-2">AI is scanning the document...</h3>
         <p className="text-slate-500 text-sm">Identifying student names and page boundaries.</p>
+        {isLargePdf && (
+          <p className="text-amber-600 text-xs font-bold mt-3 flex items-center justify-center gap-1.5">
+            <Layers className="w-3.5 h-3.5" />
+            PDF &gt; 10 MB — splitting at page boundaries and analyzing chunks in parallel...
+          </p>
+        )}
       </div>
     </div>
   );
@@ -305,6 +335,13 @@ export default function UploadModal({
           <p className="text-sm text-indigo-700 mt-1">Found {matched.length} matched submissions and {unmatched.length} unidentified page ranges.</p>
         </div>
       </div>
+
+      {batchChunkMessage && (
+        <div className="flex items-start gap-2.5 p-3.5 bg-amber-50 border border-amber-200 rounded-xl">
+          <Layers className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+          <p className="text-xs font-medium text-amber-800 leading-relaxed">{batchChunkMessage}</p>
+        </div>
+      )}
 
       <div className="space-y-4 max-h-[40vh] overflow-y-auto pr-2 custom-scrollbar">
         {unmatched.length > 0 && (

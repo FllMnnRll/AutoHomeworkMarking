@@ -3,6 +3,8 @@ import fs from "fs";
 import path from "path";
 import { getOrTranscribePage, getPagesFromFile, processHomeworkSlice } from "./gradingEngine";
 import { generateReasoning } from "./aiClient";
+import { isOversizedPdf, getFileSizeMb } from "./pdfChunking";
+import { runChunkedParallelOcr } from "./chunkedGrading";
 
 const prisma = new PrismaClient();
 
@@ -69,23 +71,24 @@ export async function processBatchHomework(submissionIds: string[]) {
         const fullPath = path.join(process.cwd(), 'public', sub.rawImagePath);
         const ext = path.extname(fullPath).toLowerCase();
         const pages = await getPagesFromFile(fullPath, ext);
+        const pdfChunked = isOversizedPdf(fullPath, ext);
+        const fileSizeMb = ext === ".pdf" ? getFileSizeMb(fullPath) : 0;
 
-        const pageTranscripts = await Promise.all(
-          pages.map(async (page) => {
+        const pageTranscripts = await runChunkedParallelOcr(
+          sub.id,
+          pages,
+          (page) => {
             const pageQs = solvedAnswerKey.filter(q => {
               const pNums = q.pageNumbers || (q.pageNumber ? [q.pageNumber] : [1]);
               return pNums.includes(page.pageNumber);
             });
-
-            let ocrPrompt = "";
             if (pageQs.length === 0) {
-              ocrPrompt = `You are an expert Math/Physics transcription assistant.
+              return `You are an expert Math/Physics transcription assistant.
 Attached is Page ${page.pageNumber}. Transcribe any handwritten text or formulas. If empty, output "No student work".`;
-            } else {
-              const masterQuestionsList = pageQs.map(q => `${q.questionNumber} (${q.type})`).join(", ");
-              
-              if (assignment.gradingDepth === "Fast" || assignment.evaluationType === "Homework") {
-                ocrPrompt = `You are an expert transcription assistant.
+            }
+            const masterQuestionsList = pageQs.map(q => `${q.questionNumber} (${q.type})`).join(", ");
+            if (assignment.gradingDepth === "Fast" || assignment.evaluationType === "Homework") {
+              return `You are an expert transcription assistant.
 Attached is Page ${page.pageNumber}. The questions on this page are: [${masterQuestionsList}].
 Your SOLE job is to transcribe the student's FINAL CHOSEN ANSWER or FINAL OPTION LETTER for each of these questions.
 DO NOT transcribe intermediate derivation steps or working process. Just give the final answer.
@@ -93,25 +96,19 @@ For each question, output:
 ### Question [questionNumber]
 Student's final answer: [final chosen option or numerical answer]
 Wrap math in LaTeX ($ ... $ or $$ ... $$).`;
-              } else {
-                ocrPrompt = `You are an expert transcription assistant.
+            }
+            return `You are an expert transcription assistant.
 Attached is Page ${page.pageNumber}. The questions on this page are: [${masterQuestionsList}].
 Your SOLE job is to transcribe the student's handwritten answer and full working steps for each question.
 For each question, output:
 ### Question [questionNumber]
 Student's handwritten answer/work: [handwritten steps and final chosen answer]
 DO NOT transcribe the question texts. Wrap math in LaTeX.`;
-              }
-            }
-
-            const text = await getOrTranscribePage(
-              page.base64Data,
-              page.mimeType,
-              ocrPrompt,
-              `BatchEngine: Targeted OCR Page ${page.pageNumber} (${sub.id})`
-            );
-            return `## Page ${page.pageNumber}\n\n${text}`;
-          })
+          },
+          `BatchEngine: Targeted OCR (${sub.id})`,
+          pdfChunked,
+          fileSizeMb,
+          getOrTranscribePage
         );
         ocrResults.push({
           id: sub.id,
@@ -241,7 +238,8 @@ DO NOT transcribe the question texts. Wrap math in LaTeX.`;
         data: { 
           status: studentResult.totalScore < 60 ? 'Needs Review' : 'Graded', 
           needsReview: studentResult.totalScore < 60,
-          totalScore: studentResult.totalScore
+          totalScore: studentResult.totalScore,
+          processingMeta: null,
         }
       });
       console.log(`[BatchGradingEngine] Saved results for student ${res.id}`);
