@@ -1,0 +1,102 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Class {
+  id          String       @id @default(uuid())
+  name        String       @unique // e.g. "AP Physics 1"
+  createdAt   DateTime     @default(now())
+  students    Student[]
+  assignments Assignment[]
+}
+
+model Student {
+  id          String       @id @default(uuid())
+  studentId   String       @unique // e.g. "2024012"
+  name        String       // e.g. "John Doe"
+  classId     String
+  class       Class        @relation(fields: [classId], references: [id])
+  submissions Submission[]
+}
+
+model Assignment {
+  id            String       @id @default(uuid())
+  title         String       // e.g. "AP Physics 1 - Unit 2 Dynamics (Assignment #3)"
+  classId       String       @default("default_class")
+  class         Class?       @relation(fields: [classId], references: [id])
+  subject       String       @default("AP Calculus") // "AP Calculus" or "AP Physics"
+  aiMode        String       @default("Auto") // "Auto" or "AnswerKey"
+  gradingDepth  String       @default("Fast") // "Fast" or "Reasoning"
+  uploadMethod  String       @default("Manual") // "Manual" or "Email"
+  answerKeyPath String?      // Path to the uploaded answer key if aiMode is AnswerKey
+  solvedAnswerKey String?    // Cached JSON string of standard solved questions and answers
+  evaluationType  String       @default("Homework") // "Homework" or "Exam"
+  date          DateTime     @default(now())
+  submissions   Submission[]
+  analytics     ClassAnalytics?
+}
+
+model Submission {
+  id           String     @id @default(uuid())
+  studentId    String
+  student      Student    @relation(fields: [studentId], references: [id])
+  assignmentId String
+  assignment   Assignment @relation(fields: [assignmentId], references: [id])
+  
+  status       String     // "Graded", "Needs Review", "Processing OCR", "Pending"
+  needsReview  Boolean    @default(false)
+  totalScore   Int?       // e.g. 57 (representing 57%)
+  rawImagePath String?    // Stores the file path for retry purposes
+  errorMessage String?    // Stores detailed error like "Quota Exceeded" if status is Error
+  
+  slices       Slice[]
+  analytics    String?    // JSON string for student-specific analytics
+  
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+}
+
+model Slice {
+  id             String     @id @default(uuid())
+  submissionId   String
+  submission     Submission @relation(fields: [submissionId], references: [id])
+  
+  questionName   String     // e.g. "Kinematics Q3"
+  rawImagePath   String     // Path or URL to the slice image
+  ocrText        String?    // LaTeX string extracted by Gemini
+  reasoningTree  String?    // JSON string of AI logic steps
+  
+  aiScore        Int?       // AI suggested score %
+  finalScore     Int?       // Teacher adjusted score %
+  
+  createdAt      DateTime   @default(now())
+}
+
+model ClassAnalytics {
+  id                String     @id @default(uuid())
+  assignmentId      String     @unique
+  assignment        Assignment @relation(fields: [assignmentId], references: [id])
+  
+  status            String     @default("Completed") // "Generating" or "Completed"
+  concepts          String?    // JSON array
+  errorClusters     String?    // JSON array
+  remediation       String?    // JSON object
+  
+  createdAt         DateTime   @default(now())
+}
+
+model OcrCache {
+  id        String   @id @default(uuid())
+  hash      String   @unique  // MD5 checksum of page base64/binary data
+  text      String            // Transcribed Markdown output
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

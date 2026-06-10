@@ -1,0 +1,67 @@
+{
+  "startedAt": "2026-06-03T05:08:38.529Z",
+  "endedAt": "2026-06-03T05:12:53.674Z",
+  "elapsedMs": 255145,
+  "elapsedSec": 255.145,
+  "iterations": 4,
+  "finalStatusSummary": {
+    "Graded": 7,
+    "Needs Review": 2
+  },
+  "submissions": [
+    {
+      "id": "b5aa5422-91e2-46cb-b305-397e97f7f27f",
+      "status": "Graded",
+      "totalScore": 93,
+      "errorMessage": null
+    },
+    {
+      "id": "f7ced1b3-5b58-442a-9140-56fbfcb44b71",
+      "status": "Graded",
+      "totalScore": 64,
+      "errorMessage": null
+    },
+    {
+      "id": "b4e3efd7-59f6-493f-acba-185b8b7b44ce",
+      "status": "Graded",
+      "totalScore": 86,
+      "errorMessage": null
+    },
+    {
+      "id": "c642d257-5092-40f9-84d4-38abdb279e95",
+      "status": "Graded",
+      "totalScore": 77,
+      "errorMessage": null
+    },
+    {
+      "id": "4c28f9af-8b98-4649-932b-9dc0cf529fdb",
+      "status": "Needs Review",
+      "totalScore": 29,
+      "errorMessage": null
+    },
+    {
+      "id": "696f40d8-2d2b-44ce-8b5e-921c63b883e6",
+      "status": "Graded",
+      "totalScore": 79,
+      "errorMessage": null
+    },
+    {
+      "id": "11f9d78b-bc34-49c5-92e7-d3338a88f8e2",
+      "status": "Graded",
+      "totalScore": 64,
+      "errorMessage": null
+    },
+    {
+      "id": "31e94530-923b-4fc6-96bf-deee866d04a9",
+      "status": "Graded",
+      "totalScore": 86,
+      "errorMessage": null
+    },
+    {
+      "id": "36195823-9620-4ffc-a351-438a02bbc1a1",
+      "status": "Needs Review",
+      "totalScore": 36,
+      "errorMessage": null
+    }
+  ]
+}

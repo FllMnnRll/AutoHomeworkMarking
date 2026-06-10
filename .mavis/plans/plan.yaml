@@ -1,0 +1,236 @@
+version: 1
+plan:
+  name: 'AutoMark 路径 A 提速优化（目标 +50%）'
+  max_concurrency: 3
+  max_consecutive_failures: 2
+  max_cycles: 8
+  verifier_config:
+    default_verifiers: [verifier]
+    audit_sample_rate: 0.0
+tasks:
+  - id: track-concurrency
+    title: '学生级并发改造：process-next 限流 1→3'
+    assigned_to: coder
+    verified_by: verifier
+    timeout_ms: 1500000
+    prompt: |
+      项目根目录：E:\AutoHomeworkMarking
+
+      目标：把 `app/api/v1/assignments/process-next/route.ts` 从「同一时刻只处理 1 份 submission」改为「同时并行处理最多 N 份」。
+
+      具体要求（必须全部满足）：
+      1. 当前代码第 24 行写死 `const CONCURRENCY_LIMIT = 1;`。
+         - 改为读取环境变量 `process.env.GRADING_CONCURRENCY`，默认值为 3（解析为整数，无效值 fallback 到 3）。
+      2. 当前实现是「单次 HTTP 请求里 await processHomeworkSlice(...)」——这是串行的根源。
+         - 改为：在同一个 POST /process-next 请求内，**先尝试一次性拉取 N 个 Queued 任务**，然后用 `Promise.allSettled` 并行调用 `processHomeworkSlice`。
+         - 拉取任务用 `prisma.submission.findMany({ where: { status: 'Queued' }, orderBy: { createdAt: 'asc' }, take: N })`。
+         - **必须在拉取后立刻把所有选中的 submission 原子更新为 'Processing OCR'**，避免其他 process-next 并发请求抢到同一个任务。
+         - 用 `prisma.$transaction([...])` 把所有 update 包成一个事务。
+      3. 仍然保留 15 分钟 stuck task 自动重置的逻辑（文件顶部第 9-17 行），逻辑不变。
+      4. 返回 JSON 包含：success、batchSize（实际拿到的任务数）、results（每份 submission 的 id + 耗时 ms + 是否成功 + errorMessage 截断前 200 字符）。
+      5. 不要改 `lib/gradingEngine.ts` 任何代码，本任务只动 route.ts。
+
+      重要不变量（必须保留）：
+      - 任何一份 submission 的 `errorMessage` 字段仍由 gradingEngine 自己写（不要在 route 里覆盖）。
+      - 不修改 Submission 任何 schema 字段。
+      - 不动 `lib/aiClient.ts` 的并发/key 轮询逻辑。
+      - Master Key 写竞态考虑：你的任务不解决这个——3 路并发对已存在 solvedAnswerKey 的作业是安全的（Phase B 只读不写）。如果用户上传新作业第一次跑（Phase A 写 key），需要通过批次一次性只有 1 份来做——但本任务不做这件事，路线 A 的 9 份 baseline 作业 master key 都已存在。
+      - 别动 `GradingController.tsx` 的前端驱动循环；后端能并行后前端自然能 fire-and-forget。
+
+      完成后输出：
+      - 修改的文件路径（绝对路径）
+      - diff 摘要（哪些行改了）
+      - 用伪代码/注释解释 N 路并发的拉取→原子锁定→并行处理→返回 的完整流程
+      - 在 `scratch/track_concurrency_notes.md` 写一份给 verifier 看的解释说明
+
+    verify_prompt: |
+      你是 verifier。**不要只读 producer 的 diff，必须独立验证以下不变量**。
+
+      项目：E:\AutoHomeworkMarking
+      改动文件：`app/api/v1/assignments/process-next/route.ts`
+
+      验证清单（每项必须独立检查并报告 PASS/FAIL）：
+      1. **并发真并行**：用文本搜索 `Promise.all` 或 `Promise.allSettled` 在 process-next 路由代码里是否实际出现。grep 这个文件确认。
+      2. **限流可配置**：grep `GRADING_CONCURRENCY` 出现在 process-next/route.ts。手动把环境变量设为 5，看是否生效（可选：直接读代码确认 default 解析逻辑）。
+      3. **任务原子锁定**：用 sqlite3 命令行或写个 node 脚本验证：拉取 N 个任务后立刻 status 变成 'Processing OCR'。检查是否用了 `$transaction`。
+         提示命令：
+         ```
+         cd E:\AutoHomeworkMarking; node -e "const{PrismaClient}=require('@prisma/client');const p=new PrismaClient();p.submission.findMany({where:{status:'Queued'},take:5}).then(r=>{console.log('queued:',r.length);return p.\$disconnect()})"
+         ```
+      4. **不变量保留**：
+         - grep `CONCURRENCY_LIMIT` 应该不再硬编码为 1。
+         - grep `errorMessage` 在 process-next 路由里不应该被写入（应该让 gradingEngine 写）。
+         - 检查 `lib/gradingEngine.ts` 是否有任何改动（git diff 或文本搜索 mtime）。
+      5. **行为等价**：阅读代码，确认单份 submission 的处理流程（status 变化、字段写入、score 计算）和改造前一致。
+      6. **类型安全**：检查 `take: N` 和 processHomeworkSlice 的调用是否都用了 Number() 或 parseInt 后的整数。
+
+      输出格式：
+      - 每项 PASS/FAIL + 证据（grep 输出 / 引用代码行 / 命令输出）
+      - 总评：如果有任何 FAIL，给出最小可重现的修复建议
+      - 写入 `scratch/verifier_track_concurrency.md`
+
+  - id: track-engine-tuning
+    title: 'lib/gradingEngine.ts 优化：Cross-Val 概率 + PDF 缩放 + prompt 精简'
+    assigned_to: coder
+    verified_by: verifier
+    timeout_ms: 1500000
+    prompt: |
+      项目根目录：E:\AutoHomeworkMarking
+      目标文件：`lib/gradingEngine.ts`
+
+      目标：在不改变业务行为、不破坏 OCR/推理准确率的前提下，做 3 个独立微调节省时间。
+
+      改动清单（每条都要做）：
+
+      1. **Cross-Validation 概率下调**：第 241 行 `isCrossValidation = Math.random() < 0.25;`
+         - 改为读取 `process.env.CROSS_VAL_PROB`，默认 `0.10`（即 10%）。
+         - 解析逻辑：parseFloat，无效值 fallback 0.10，限制在 [0, 1] 区间。
+         - 加一行 console.log 记录当前实际概率和走的分支（`Targeted OCR` 或 `Cross-Validation OCR` 或 `Full OCR`）。
+
+      2. **PDF 栅格化缩放降低**：第 101 行 `const viewport = page.getViewport({ scale: 2.0 });`
+         - 改为读取 `process.env.PDF_RASTER_SCALE`，默认 `1.6`。
+         - 解析逻辑：parseFloat，无效值 fallback 1.6，限制在 [0.5, 3.0] 区间。
+         - 加一行 console.log 记录实际使用的 scale 值。
+
+      3. **Master Key JSON 序列化精简**：第 393 行 和 第 449 行
+         - 都有 `JSON.stringify(solvedAnswerKey, null, 2)` 这种带 2 空格缩进的写法。
+         - 改为 `JSON.stringify(solvedAnswerKey)`（去掉缩进参数）。token 节省约 20-30%，推理模型对内容无差异。
+         - **不要动任何 system prompt 的文字内容**（"under 15 words"、双转义规则、JSON schema 描述、CRITICAL 关键字全部保留）。
+
+      重要不变量（必须 100% 保留）：
+      - 所有 system prompt 的指令文字一字不改
+      - JSON schema 的字段名、必填项、类型描述一字不改
+      - 不要改函数签名（`processHomeworkSlice` 仍是 `async (submissionId, imagePath)`）
+      - 不要改数据库 schema
+      - 不要改 `getOrTranscribePage` 的 prompt hash 逻辑（虽然 base64 相同的概率低，但 prompt 文本变化会让缓存命中率受轻微影响——这是可接受的）
+      - 不要改 OcrCache 写入逻辑
+
+      完成后输出：
+      - 修改的具体行号（before/after 对比）
+      - 三个环境变量的默认值和合法范围
+      - 在 `scratch/track_engine_tuning_notes.md` 写一份给 verifier 的改动说明
+
+    verify_prompt: |
+      你是 verifier。**必须独立 grep 验证每一处改动**。
+
+      项目：E:\AutoHomeworkMarking
+      改动文件：`lib/gradingEngine.ts`
+
+      验证清单（每项必须独立检查）：
+
+      1. **Cross-Val 概率环境变量化**：
+         - grep `Math.random() < 0.25` 应该找不到。
+         - grep `CROSS_VAL_PROB` 应该命中。
+         - 检查默认值是 0.10，不是别的。
+
+      2. **PDF 缩放环境变量化**：
+         - grep `scale: 2.0` 应该找不到（`scale: 1.6` 是默认值）。
+         - grep `PDF_RASTER_SCALE` 应该命中。
+         - 检查默认 1.6 合法范围限制（0.5, 3.0）存在。
+
+      3. **JSON 缩进去除**：
+         - grep `JSON.stringify(solvedAnswerKey, null, 2)` 应该找不到。
+         - 找到的应该是 `JSON.stringify(solvedAnswerKey)`。
+         - 出现位置应该有 2 处（line 393 附近 + line 449 附近）。
+
+      4. **关键不变量保留**：
+         - grep `under 15 words` 应该仍在 prompt 中。
+         - grep `CRITICAL JSON` 应该仍存在。
+         - grep `double-escape` 或 `Double-escape` 应该仍存在。
+         - grep `pageNumbers` schema 字段应该仍存在。
+         - 函数 `processHomeworkSlice` 签名不变。
+
+      5. **Baseline 行为可比性**：
+         - 对比改动前后的 system prompt 文字 token 数：用 wc 或 node 脚本计算。
+         - 重点：减少的是 JSON 缩进空白，**不是 prompt 语义内容**。
+
+      6. **环境变量边界**：
+         - 模拟一个无效输入（如 'abc'、'-1'、'5'），确认 fallback 行为。
+
+      输出格式：
+      - 每项 PASS/FAIL + grep 输出证据
+      - 给出 system prompt 改前/改后字节数对比
+      - 写入 `scratch/verifier_track_engine_tuning.md`
+
+  - id: verifier-regression
+    title: '端到端回归：跑 baseline 9 份作业验证准确率 + 性能对比'
+    assigned_to: verifier
+    depends_on: [track-concurrency, track-engine-tuning]
+    verified_by: verifier
+    timeout_ms: 1800000
+    prompt: |
+      项目根目录：E:\AutoHomeworkMarking
+      目标：跑改动后的代码 + 改动后的 9 份 baseline 作业，验证两件事：
+        A. aiScore 数字与 baseline 一致（准确率不掉）
+        B. 端到端耗时相对 baseline 提速 ≥ 50%
+
+      Baseline 数据已固化在：`E:\AutoHomeworkMarking\scratch\baseline_5.1_hw_test.json`
+      关键文件：
+        - Assignment ID: `efff1085-dd55-4cdd-b12a-c8537e4c4d26`
+        - 9 份 submission，每份 rawImagePath 都指向 `/uploads/efff1085-dd55-4cdd-b12a-c8537e4c4d26/student_XXX_<timestamp>.pdf`
+
+      Step 1：清理旧批改数据（保留 submission 记录和 PDF 文件，但删除 slice 并把 status 改回 Queued）
+        写一个 `scratch/reset_for_rerun.js`：
+        - 删除这 9 份 submission 的所有 Slice
+        - 把 9 份 submission 的 status 改成 'Queued'，needsReview 改 false，totalScore 改 null，errorMessage 改 null
+        - updatedAt 设为现在
+        跑这个脚本并确认成功。
+
+      Step 2：启动 Next.js dev 服务（后台）
+        ```
+        cd E:\AutoHomeworkMarking
+        $env:GRADING_CONCURRENCY = "3"
+        npm run dev
+        ```
+        等待 'Ready' 输出，确认服务在 http://localhost:3000 可访问。
+        **必须用 GRADING_CONCURRENCY=3 启动**。
+
+      Step 3：手动循环触发 process-next 直到 9 份全部 Graded
+        写个 `scratch/drive_rerun.js`：
+        - 每 3 秒调用一次 POST /api/v1/assignments/process-next
+        - 当所有 9 份 status 都不是 Queued/Processing OCR 时停止
+        - 记录开始时间、结束时间、总耗时
+        - 调用方法可以用 `node-fetch` 或 `fetch`（Node 18+ 自带 fetch）。
+
+      Step 4：拉取最新数据对比
+        跑 `scratch/snapshot_baseline.js`（用同样参数）的对照版本 `scratch/snapshot_after.js`，
+        拉取这 9 份的 `slice.aiScore` 和 `submission.totalScore`。
+
+      Step 5：写对比报告 `scratch/regression_report.md`
+        必须包含：
+        - 改动前 vs 改动后，每份 submission 的 aiScore 对比表
+        - **重要**：因为 prompt 精简 + 概率变化是非确定性的（DeepSeek 推理有随机性），允许 ±2 分的浮动（比如 93→91 或 93→95 算 PASS，93→50 算 FAIL）。
+        - 端到端耗时：改动前 baseline 是 9 份串行（每份 ~20-50s，总计 ~3-8 分钟），改动后预期 < 2 分钟。
+        - 给出「提速百分比」计算：`(baseline_time - new_time) / baseline_time * 100%`
+        - 注意：baseline 的耗时数据我们没有实测过，需要从 baseline JSON 的 capturedAt 推断可能不准确，所以**保守估计**：以「9 份串行每份 30s 平均 = 270s」作为 baseline 下界。改动后只要 < 135s 就算 +50%。
+        - 任何 aiScore 偏差 > 5 分的 submission 必须高亮并解释（看 submission.errorMessage）
+
+      Step 6：清理
+        测试完后可以保留 submission 数据（方便用户看），但要在报告里说明。
+
+      决策：
+      - 如果 9 份 aiScore 全部在 ±2 分内、且耗时 < 135s：判定 PASS，写入 `scratch/regression_report.md` 顶部。
+      - 如果有 1 份 ±2~5 分：单独标注，让用户决定是否接受。
+      - 如果有 ≥ 1 份偏差 > 5 分：判定 FAIL，需要回退某项改动。
+
+      完成后输出：
+      - `scratch/regression_report.md` 完整报告
+      - 简要回复（在你的最终消息里）：
+        - 总耗时多少秒
+        - 9 份 aiScore 数字
+        - 提速百分比
+        - PASS / FAIL 判定
+
+    verify_prompt: |
+      你是 verifier。**必须独立核对回归报告**。
+
+      读取 `E:\AutoHomeworkMarking\scratch\regression_report.md`，验证：
+      1. 报告里列出的 9 份 aiScore 数字，要和 `E:\AutoHomeworkMarking\scratch\baseline_5.1_hw_test.json` 里的 `aiScore` 字段对比，每份偏差 ≤ 2 分。
+      2. 报告里声称的总耗时，从 `scratch/regression_report.md` 的具体表格里读，要 ≤ 135s。
+      3. 报告里没漏掉任何一份 submission。
+      4. 实际去 sqlite 数据库里读一遍最新 9 份 submission 的 status，确认全部不是 Queued/Processing OCR（说明真的跑完了，不是被中断）。
+         用 `cd E:\AutoHomeworkMarking; node -e "const{PrismaClient}=require('@prisma/client');const p=new PrismaClient();p.submission.findMany({where:{assignmentId:'efff1085-dd55-4cdd-b12a-c8537e4c4d26'},select:{student:{select:{name:true}},status:true,totalScore:true,slices:{select:{aiScore:true}}}}).then(r=>{console.log(JSON.stringify(r,null,2));return p.\$disconnect()})"` 验证。
+
+      判定：
+      - 所有 9 份 ≤ 2 分偏差 + 耗时 < 135s + DB 状态非 Queued → PASS
+      - 否则 → FAIL，列出具体哪些不满足

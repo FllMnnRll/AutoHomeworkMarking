@@ -1,0 +1,168 @@
+{
+  "capturedAt": "2026-06-03T05:13:38.053Z",
+  "assignment": {
+    "id": "efff1085-dd55-4cdd-b12a-c8537e4c4d26",
+    "title": "hw5.1 test",
+    "subject": "AP Physics",
+    "className": "AP Physics 1",
+    "aiMode": "Auto",
+    "evaluationType": "Homework",
+    "hasSolvedKey": true,
+    "solvedKeyLen": 14
+  },
+  "submissions": [
+    {
+      "id": "b5aa5422-91e2-46cb-b305-397e97f7f27f",
+      "student": "Luna",
+      "studentId": "104",
+      "rawImagePath": "/uploads/efff1085-dd55-4cdd-b12a-c8537e4c4d26/student_104_1780389335967.pdf",
+      "status": "Graded",
+      "totalScore": 93,
+      "needsReview": false,
+      "errorMessage": null,
+      "updatedAt": "2026-06-03T05:09:15.003Z",
+      "aiScore": 93,
+      "finalScore": 93,
+      "sliceCount": 1,
+      "sliceScores": [
+        93
+      ]
+    },
+    {
+      "id": "f7ced1b3-5b58-442a-9140-56fbfcb44b71",
+      "student": "Lydia",
+      "studentId": "107",
+      "rawImagePath": "/uploads/efff1085-dd55-4cdd-b12a-c8537e4c4d26/student_107_1780389336016.pdf",
+      "status": "Graded",
+      "totalScore": 64,
+      "needsReview": false,
+      "errorMessage": null,
+      "updatedAt": "2026-06-03T05:09:36.606Z",
+      "aiScore": 64,
+      "finalScore": 64,
+      "sliceCount": 1,
+      "sliceScores": [
+        64
+      ]
+    },
+    {
+      "id": "b4e3efd7-59f6-493f-acba-185b8b7b44ce",
+      "student": "Xena",
+      "studentId": "106",
+      "rawImagePath": "/uploads/efff1085-dd55-4cdd-b12a-c8537e4c4d26/student_106_1780389336044.pdf",
+      "status": "Graded",
+      "totalScore": 86,
+      "needsReview": false,
+      "errorMessage": null,
+      "updatedAt": "2026-06-03T05:10:27.603Z",
+      "aiScore": 86,
+      "finalScore": 86,
+      "sliceCount": 1,
+      "sliceScores": [
+        86
+      ]
+    },
+    {
+      "id": "c642d257-5092-40f9-84d4-38abdb279e95",
+      "student": "Barry",
+      "studentId": "102",
+      "rawImagePath": "/uploads/efff1085-dd55-4cdd-b12a-c8537e4c4d26/student_102_1780389336066.pdf",
+      "status": "Graded",
+      "totalScore": 77,
+      "needsReview": false,
+      "errorMessage": null,
+      "updatedAt": "2026-06-03T05:11:12.721Z",
+      "aiScore": 77,
+      "finalScore": 77,
+      "sliceCount": 1,
+      "sliceScores": [
+        77
+      ]
+    },
+    {
+      "id": "4c28f9af-8b98-4649-932b-9dc0cf529fdb",
+      "student": "Michael",
+      "studentId": "101",
+      "rawImagePath": "/uploads/efff1085-dd55-4cdd-b12a-c8537e4c4d26/student_101_1780389336113.pdf",
+      "status": "Needs Review",
+      "totalScore": 29,
+      "needsReview": true,
+      "errorMessage": null,
+      "updatedAt": "2026-06-03T05:11:30.356Z",
+      "aiScore": 29,
+      "finalScore": 29,
+      "sliceCount": 1,
+      "sliceScores": [
+        29
+      ]
+    },
+    {
+      "id": "696f40d8-2d2b-44ce-8b5e-921c63b883e6",
+      "student": "Kaden",
+      "studentId": "109",
+      "rawImagePath": "/uploads/efff1085-dd55-4cdd-b12a-c8537e4c4d26/student_109_1780389336128.pdf",
+      "status": "Graded",
+      "totalScore": 79,
+      "needsReview": false,
+      "errorMessage": null,
+      "updatedAt": "2026-06-03T05:11:17.320Z",
+      "aiScore": 79,
+      "finalScore": 79,
+      "sliceCount": 1,
+      "sliceScores": [
+        79
+      ]
+    },
+    {
+      "id": "11f9d78b-bc34-49c5-92e7-d3338a88f8e2",
+      "student": "Sunny",
+      "studentId": "103",
+      "rawImagePath": "/uploads/efff1085-dd55-4cdd-b12a-c8537e4c4d26/student_103_1780389336145.pdf",
+      "status": "Graded",
+      "totalScore": 64,
+      "needsReview": false,
+      "errorMessage": null,
+      "updatedAt": "2026-06-03T05:12:50.667Z",
+      "aiScore": 64,
+      "finalScore": 64,
+      "sliceCount": 1,
+      "sliceScores": [
+        64
+      ]
+    },
+    {
+      "id": "31e94530-923b-4fc6-96bf-deee866d04a9",
+      "student": "Tar",
+      "studentId": "105",
+      "rawImagePath": "/uploads/efff1085-dd55-4cdd-b12a-c8537e4c4d26/student_105_1780389336174.pdf",
+      "status": "Graded",
+      "totalScore": 86,
+      "needsReview": false,
+      "errorMessage": null,
+      "updatedAt": "2026-06-03T05:12:46.071Z",
+      "aiScore": 86,
+      "finalScore": 86,
+      "sliceCount": 1,
+      "sliceScores": [
+        86
+      ]
+    },
+    {
+      "id": "36195823-9620-4ffc-a351-438a02bbc1a1",
+      "student": "Wayne",
+      "studentId": "108",
+      "rawImagePath": "/uploads/efff1085-dd55-4cdd-b12a-c8537e4c4d26/student_108_1780389336186.pdf",
+      "status": "Needs Review",
+      "totalScore": 36,
+      "needsReview": true,
+      "errorMessage": null,
+      "updatedAt": "2026-06-03T05:12:14.039Z",
+      "aiScore": 36,
+      "finalScore": 36,
+      "sliceCount": 1,
+      "sliceScores": [
+        36
+      ]
+    }
+  ]
+}
