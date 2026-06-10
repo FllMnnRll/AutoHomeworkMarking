@@ -17,7 +17,7 @@ if (fs.existsSync(envPath)) {
 }
 
 async function main() {
-  const apiKey = "AIzaSyDf1osYb9qdoJDq0_tkMeel9kJuPggZYJw";
+  const apiKey = process.env.GEMINI_API_KEY;
   console.log("Using API Key:", apiKey ? `${apiKey.substring(0, 8)}...` : "None");
   
   const ai = new GoogleGenAI({ apiKey });
