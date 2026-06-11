@@ -1,11 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { PrismaClient } from "@prisma/client";
+import { prisma } from "@/lib/prisma";
 import { PDFDocument } from "pdf-lib";
 import fs from "fs";
 import path from "path";
-import { processHomeworkSlice } from "@/lib/gradingEngine";
-
-const prisma = new PrismaClient();
 
 export async function POST(req: NextRequest) {
   try {
@@ -27,10 +24,10 @@ export async function POST(req: NextRequest) {
     const uploadDir = path.join(process.cwd(), "public", "uploads", assignmentId);
     if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
-    let successCount = 0;
-    const tasks: { id: string, path: string }[] = [];
-
-    // Process each student's assignment from the mapping
+    // Phase 1 (sequential): copy pages out of the shared master document.
+    // pdf-lib does not guarantee concurrent safety on a shared source doc,
+    // so the copy step stays serial; everything downstream is independent.
+    const studentJobs: { studentId: string; studentPdf: PDFDocument }[] = [];
     for (const mapping of finalMapping) {
       if (!mapping.studentId) continue; // Skip if still unassigned
       
@@ -39,36 +36,40 @@ export async function POST(req: NextRequest) {
       
       if (startIdx > endIdx || startIdx >= totalPages) continue; // Invalid range
 
-      // Create a new PDF for this student
       const studentPdf = await PDFDocument.create();
       const pageIndices = Array.from({ length: endIdx - startIdx + 1 }, (_, i) => startIdx + i);
       const copiedPages = await studentPdf.copyPages(masterPdfDoc, pageIndices);
-      
       for (const page of copiedPages) {
         studentPdf.addPage(page);
       }
-
-      const pdfBytes = await studentPdf.save();
-      
-      const fileName = `student_${mapping.studentId}_${Date.now()}.pdf`;
-      const savePath = path.join(uploadDir, fileName);
-      fs.writeFileSync(savePath, pdfBytes);
-
-      const dbImagePath = `/uploads/${assignmentId}/${fileName}`;
-
-      // Create submission record
-      const submission = await prisma.submission.create({
-        data: {
-          student: { connect: { studentId: mapping.studentId } },
-          assignment: { connect: { id: assignmentId } },
-          status: "Queued",
-          needsReview: false,
-          rawImagePath: dbImagePath
-        }
-      });
-
-      successCount++;
+      studentJobs.push({ studentId: mapping.studentId, studentPdf });
     }
+
+    // Phase 2 (parallel): serialize each student PDF, write to disk and create
+    // the submission record concurrently.
+    await Promise.all(
+      studentJobs.map(async ({ studentId, studentPdf }) => {
+        const pdfBytes = await studentPdf.save();
+
+        const fileName = `student_${studentId}_${Date.now()}.pdf`;
+        const savePath = path.join(uploadDir, fileName);
+        await fs.promises.writeFile(savePath, pdfBytes);
+
+        const dbImagePath = `/uploads/${assignmentId}/${fileName}`;
+
+        await prisma.submission.create({
+          data: {
+            student: { connect: { studentId } },
+            assignment: { connect: { id: assignmentId } },
+            status: "Queued",
+            needsReview: false,
+            rawImagePath: dbImagePath
+          }
+        });
+      })
+    );
+
+    const successCount = studentJobs.length;
 
     // Clean up temporary file
     try {

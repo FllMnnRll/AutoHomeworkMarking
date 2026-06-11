@@ -1,10 +1,8 @@
-import { PrismaClient } from "@prisma/client";
+import { prisma } from "@/lib/prisma";
 import ReviewClient from "./ReviewClient";
 import { redirect } from "next/navigation";
 
 export const dynamic = 'force-dynamic';
-
-const prisma = new PrismaClient();
 
 export default async function ReviewPage({ searchParams }: { searchParams: Promise<{ submissionId?: string }> }) {
   // If no submissionId is provided, just grab the first one that needs review

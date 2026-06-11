@@ -1,8 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { PrismaClient } from "@prisma/client";
+import { prisma } from "@/lib/prisma";
 import { generateReasoning } from "@/lib/aiClient";
-
-const prisma = new PrismaClient();
 
 export async function POST(req: NextRequest, context: { params: Promise<{ id: string }> }) {
   try {

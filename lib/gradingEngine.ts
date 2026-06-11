@@ -1,6 +1,6 @@
-import { PrismaClient } from '@prisma/client';
 import fs from 'fs';
 import path from 'path';
+import { prisma } from './prisma';
 import { generateContentWithFallback } from './aiClient';
 import { PDFDocument } from 'pdf-lib';
 import crypto from 'crypto';
@@ -11,7 +11,7 @@ import {
   clearSubmissionMeta,
 } from './chunkedGrading';
 
-const prisma = new PrismaClient();
+export type RasterizedPage = { base64Data: string; mimeType: string; pageNumber: number };
 
 /**
  * Gets or transcribes a page's visual content using a hash of the image data & prompt.
@@ -84,7 +84,7 @@ export async function getOrTranscribePage(
  * If PDF: returns an array of base64 strings representing JPEG images of each page.
  * If Image: returns an array containing the single image's base64 string.
  */
-export async function getPagesFromFile(filePath: string, ext: string): Promise<{ base64Data: string; mimeType: string; pageNumber: number }[]> {
+export async function getPagesFromFile(filePath: string, ext: string): Promise<RasterizedPage[]> {
   const fileBuffer = fs.readFileSync(filePath);
   
   if (ext === '.pdf') {
@@ -99,39 +99,57 @@ export async function getPagesFromFile(filePath: string, ext: string): Promise<{
       const pageCount = pdfDoc.numPages;
       console.log(`[GradingEngine] Loaded PDF with ${pageCount} pages. Rendering to JPEG...`);
       
-      const pages: { base64Data: string; mimeType: string; pageNumber: number }[] = [];
-      
       // Tunable: PDF rasterization scale. Lower = smaller payload to Gemini, faster.
       // Default 2.0. Range [0.5, 3.0]. Override via env PDF_RASTER_SCALE.
       const parsedScale = parseFloat(process.env.PDF_RASTER_SCALE as string);
       const pdfRasterScale = Number.isFinite(parsedScale)
         ? Math.min(3.0, Math.max(0.5, parsedScale))
         : 2.0;
-      console.log(`[GradingEngine] PDF raster scale = ${pdfRasterScale} (env PDF_RASTER_SCALE=${process.env.PDF_RASTER_SCALE ?? "unset"}, default 2.0)`);
 
-      for (let i = 1; i <= pageCount; i++) {
-        const page = await pdfDoc.getPage(i);
-        // Render at the configured scale (default 2.0) to balance OCR quality vs payload size.
-        const viewport = page.getViewport({ scale: pdfRasterScale });
+      // Tunable: JPEG quality for rasterized pages. Lower = smaller payload, faster
+      // upload to the OCR model. Default 0.85. Range [0.5, 1.0]. Env PDF_JPEG_QUALITY.
+      const parsedQuality = parseFloat(process.env.PDF_JPEG_QUALITY as string);
+      const jpegQuality = Number.isFinite(parsedQuality)
+        ? Math.min(1.0, Math.max(0.5, parsedQuality))
+        : 0.85;
 
-        const canvas = createCanvas(viewport.width, viewport.height);
-        const context = canvas.getContext('2d');
+      // Tunable: how many pages are rendered concurrently. Default 4. Range [1, 8].
+      const parsedConcurrency = parseInt(process.env.PDF_RASTER_CONCURRENCY ?? "", 10);
+      const rasterConcurrency = Number.isFinite(parsedConcurrency)
+        ? Math.min(8, Math.max(1, parsedConcurrency))
+        : 4;
 
-        const renderContext = {
-          canvasContext: context,
-          viewport: viewport,
-        };
+      console.log(`[GradingEngine] PDF raster scale=${pdfRasterScale}, jpegQuality=${jpegQuality}, concurrency=${rasterConcurrency}`);
 
-        await page.render(renderContext).promise;
-        
-        // Save as JPEG to base64
-        const jpegBuffer = canvas.toBuffer('image/jpeg', { quality: 0.95 });
-        pages.push({
-          base64Data: jpegBuffer.toString('base64'),
-          mimeType: 'image/jpeg',
-          pageNumber: i
-        });
-      }
+      const pages: RasterizedPage[] = new Array(pageCount);
+      let nextPage = 1;
+
+      const renderWorkers = Array.from(
+        { length: Math.min(rasterConcurrency, pageCount) },
+        async () => {
+          while (true) {
+            const i = nextPage++;
+            if (i > pageCount) break;
+
+            const page = await pdfDoc.getPage(i);
+            const viewport = page.getViewport({ scale: pdfRasterScale });
+
+            const canvas = createCanvas(viewport.width, viewport.height);
+            const context = canvas.getContext('2d');
+
+            await page.render({ canvasContext: context, viewport }).promise;
+
+            const jpegBuffer = canvas.toBuffer('image/jpeg', { quality: jpegQuality });
+            pages[i - 1] = {
+              base64Data: jpegBuffer.toString('base64'),
+              mimeType: 'image/jpeg',
+              pageNumber: i
+            };
+          }
+        }
+      );
+      await Promise.all(renderWorkers);
+
       return pages;
     } catch (err) {
       console.error("[GradingEngine] Failed to rasterize PDF using canvas/pdfjs, falling back to treating whole file as single page:", err);

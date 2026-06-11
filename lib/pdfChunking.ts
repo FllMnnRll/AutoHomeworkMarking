@@ -156,23 +156,27 @@ export async function splitPdfBufferIntoPageRanges(
   const avgBytesPerPage = Math.max(1, Math.ceil(fileBuffer.length / totalPages));
   const pagesPerChunk = Math.max(1, Math.floor(maxBytes / avgBytesPerPage));
 
-  const chunks: PdfPageRangeChunk[] = [];
+  // Phase 1 (sequential): copy pages out of the shared source document.
+  // pdf-lib does not guarantee concurrent safety on a shared source doc.
+  const docs: { newDoc: PDFDocument; start: number; end: number }[] = [];
   for (let start = 0; start < totalPages; start += pagesPerChunk) {
     const end = Math.min(start + pagesPerChunk, totalPages);
     const newDoc = await PDFDocument.create();
     const pageIndices = Array.from({ length: end - start }, (_, i) => start + i);
     const copied = await newDoc.copyPages(srcDoc, pageIndices);
     copied.forEach((p) => newDoc.addPage(p));
-    const chunkBuffer = Buffer.from(await newDoc.save());
-    chunks.push({
-      buffer: chunkBuffer,
+    docs.push({ newDoc, start, end });
+  }
+
+  // Phase 2 (parallel): serialize each independent sub-document.
+  return Promise.all(
+    docs.map(async ({ newDoc, start, end }) => ({
+      buffer: Buffer.from(await newDoc.save()),
       startPage: start + 1,
       endPage: end,
       pageOffset: start,
-    });
-  }
-
-  return chunks;
+    }))
+  );
 }
 
 export function buildProcessingMeta(

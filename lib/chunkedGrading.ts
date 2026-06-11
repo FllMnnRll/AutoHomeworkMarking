@@ -1,4 +1,4 @@
-import { PrismaClient } from "@prisma/client";
+import { prisma } from "./prisma";
 import {
   PageLike,
   ProcessingMeta,
@@ -20,8 +20,6 @@ export type TranscribeFn = (
   prompt: string,
   contextStr: string
 ) => Promise<string>;
-
-const prisma = new PrismaClient();
 
 export async function updateSubmissionMeta(
   submissionId: string,

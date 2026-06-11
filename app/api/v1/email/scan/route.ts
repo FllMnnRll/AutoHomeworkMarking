@@ -1,13 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
-import { PrismaClient } from "@prisma/client";
+import { prisma } from "@/lib/prisma";
 import { processHomeworkSlice } from "@/lib/gradingEngine";
 import { resolveSecret } from "@/lib/secrets";
 import fs from "fs";
 import path from "path";
-
-const prisma = new PrismaClient();
 
 export async function POST(req: NextRequest) {
   try {

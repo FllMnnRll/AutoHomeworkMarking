@@ -1,12 +1,40 @@
-import { PrismaClient, Submission, Assignment } from "@prisma/client";
-import fs from "fs";
 import path from "path";
-import { getOrTranscribePage, getPagesFromFile, processHomeworkSlice } from "./gradingEngine";
+import { prisma } from "./prisma";
+import { getOrTranscribePage, getPagesFromFile, processHomeworkSlice, RasterizedPage } from "./gradingEngine";
 import { generateReasoning } from "./aiClient";
 import { isOversizedPdf, getFileSizeMb } from "./pdfChunking";
 import { runChunkedParallelOcr } from "./chunkedGrading";
 
-const prisma = new PrismaClient();
+// How many PDFs are rasterized concurrently during the preheat phase
+// (while the first submission is busy generating the Master Key).
+const PREHEAT_WORKERS = 2;
+
+/**
+ * Kick off PDF rasterization for the given submissions with bounded
+ * concurrency, returning a map of submissionId -> pages promise.
+ * This lets rasterization overlap with the (slow) Master Key generation
+ * instead of starting only after it finishes.
+ */
+function preheatRasterization(
+  subs: { id: string; rawImagePath: string | null }[]
+): Map<string, Promise<RasterizedPage[]>> {
+  const map = new Map<string, Promise<RasterizedPage[]>>();
+  const chains: Promise<unknown>[] = Array.from({ length: PREHEAT_WORKERS }, () => Promise.resolve());
+  let w = 0;
+
+  for (const sub of subs) {
+    if (!sub.rawImagePath) continue;
+    const fullPath = path.join(process.cwd(), "public", sub.rawImagePath);
+    const ext = path.extname(fullPath).toLowerCase();
+    const pagesPromise = chains[w].then(() => getPagesFromFile(fullPath, ext));
+    map.set(sub.id, pagesPromise);
+    // Keep the worker chain alive on failure; the consumer still observes the rejection.
+    chains[w] = pagesPromise.catch(() => {});
+    w = (w + 1) % PREHEAT_WORKERS;
+  }
+
+  return map;
+}
 
 export async function processBatchHomework(submissionIds: string[]) {
   if (submissionIds.length === 0) return [];
@@ -27,9 +55,17 @@ export async function processBatchHomework(submissionIds: string[]) {
   let solvedKeyStr = assignment.solvedAnswerKey;
   let remainingSubmissions = [...submissions];
 
+  let preheatedPages: Map<string, Promise<RasterizedPage[]>> = new Map();
+
   if ((!solvedKeyStr || JSON.parse(solvedKeyStr).length === 0) && assignment.aiMode !== "AnswerKey") {
     console.log(`[BatchGradingEngine] No Master Key found. Processing first submission sequentially to generate key.`);
     const firstSub = remainingSubmissions.shift();
+
+    // While the first submission is generating the Master Key (slow: full OCR +
+    // reasoning), rasterize the remaining PDFs in the background so the Targeted
+    // OCR phase can start immediately once the key is ready.
+    preheatedPages = preheatRasterization(remainingSubmissions);
+
     if (firstSub && firstSub.rawImagePath) {
       await processHomeworkSlice(firstSub.id, firstSub.rawImagePath);
     }
@@ -70,7 +106,7 @@ export async function processBatchHomework(submissionIds: string[]) {
         
         const fullPath = path.join(process.cwd(), 'public', sub.rawImagePath);
         const ext = path.extname(fullPath).toLowerCase();
-        const pages = await getPagesFromFile(fullPath, ext);
+        const pages = await (preheatedPages.get(sub.id) ?? getPagesFromFile(fullPath, ext));
         const pdfChunked = isOversizedPdf(fullPath, ext);
         const fileSizeMb = ext === ".pdf" ? getFileSizeMb(fullPath) : 0;
 
@@ -209,41 +245,48 @@ DO NOT transcribe the question texts. Wrap math in LaTeX.`;
     const aiResult = JSON.parse(cleanJson);
     const resultsMap = aiResult.results || {};
 
-    // 5. Save results
+    // 5. Save all results in a single transaction (one DB round-trip batch
+    //    instead of 2 sequential writes per student).
+    const dbOps = [];
+    let savedCount = 0;
     for (const res of ocrResults) {
       const studentResult = resultsMap[res.id];
       if (!studentResult) {
         console.error(`[BatchGradingEngine] LLM omitted results for student ${res.id}`);
-        await prisma.submission.update({
+        dbOps.push(prisma.submission.update({
           where: { id: res.id },
           data: { status: 'Error', needsReview: true, errorMessage: 'LLM omitted this student in batch output' }
-        });
+        }));
         continue;
       }
 
-      await prisma.slice.create({
-        data: {
-          submissionId: res.id,
-          questionName: 'Processed Batch Homework',
-          rawImagePath: res.rawImagePath,
-          ocrText: res.markdown,
-          reasoningTree: JSON.stringify(studentResult.pipeline),
-          aiScore: studentResult.totalScore,
-          finalScore: studentResult.totalScore
-        }
-      });
-
-      await prisma.submission.update({
-        where: { id: res.id },
-        data: { 
-          status: studentResult.totalScore < 60 ? 'Needs Review' : 'Graded', 
-          needsReview: studentResult.totalScore < 60,
-          totalScore: studentResult.totalScore,
-          processingMeta: null,
-        }
-      });
-      console.log(`[BatchGradingEngine] Saved results for student ${res.id}`);
+      dbOps.push(
+        prisma.slice.create({
+          data: {
+            submissionId: res.id,
+            questionName: 'Processed Batch Homework',
+            rawImagePath: res.rawImagePath,
+            ocrText: res.markdown,
+            reasoningTree: JSON.stringify(studentResult.pipeline),
+            aiScore: studentResult.totalScore,
+            finalScore: studentResult.totalScore
+          }
+        }),
+        prisma.submission.update({
+          where: { id: res.id },
+          data: { 
+            status: studentResult.totalScore < 60 ? 'Needs Review' : 'Graded', 
+            needsReview: studentResult.totalScore < 60,
+            totalScore: studentResult.totalScore,
+            processingMeta: null,
+          }
+        })
+      );
+      savedCount++;
     }
+
+    await prisma.$transaction(dbOps);
+    console.log(`[BatchGradingEngine] Saved results for ${savedCount}/${ocrResults.length} students in one transaction.`);
     
     return [{ success: true }];
 
@@ -257,12 +300,10 @@ DO NOT transcribe the question texts. Wrap math in LaTeX.`;
     }
 
     // Mark all remaining in batch as error
-    for (const res of ocrResults) {
-      await prisma.submission.update({
-        where: { id: res.id },
-        data: { status: 'Error', needsReview: true, errorMessage: msg }
-      });
-    }
+    await prisma.submission.updateMany({
+      where: { id: { in: ocrResults.map(r => r.id) } },
+      data: { status: 'Error', needsReview: true, errorMessage: msg }
+    });
     
     return [{ success: false, error: msg }];
   }

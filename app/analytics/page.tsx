@@ -1,12 +1,10 @@
 import React from "react";
-import { PrismaClient } from "@prisma/client";
+import { prisma } from "@/lib/prisma";
 import StudentAnalyticsClient from "./StudentAnalyticsClient";
 import ClassAnalyticsClient from "./ClassAnalyticsClient";
 import AnalyticsHistoryList from "./AnalyticsHistoryList";
 
 export const dynamic = 'force-dynamic';
-
-const prisma = new PrismaClient();
 
 export default async function AnalyticsDashboard({ 
   searchParams 

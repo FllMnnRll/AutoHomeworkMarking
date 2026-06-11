@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { PrismaClient } from "@prisma/client";
+import { prisma } from "@/lib/prisma";
 import { generateReasoning } from "@/lib/aiClient";
 
-const prisma = new PrismaClient();
+// How many per-student analytics AI calls run concurrently.
+const STUDENT_ANALYTICS_CONCURRENCY = 4;
 
 // GET: Check the current status of Class Analytics
 export async function GET(req: NextRequest, context: { params: Promise<{ id: string }> }) {
@@ -147,22 +148,27 @@ async function runClassAnalyticsInBg(id: string) {
   if (!dsResultRaw) throw new Error("Empty response from DeepSeek API");
   let analyticsJson;
   try {
-    // Try to auto-fix trailing commas and unescaped newlines which are common LLM JSON mistakes
-    let fixedJson = dsResultRaw
-      .replace(/,\s*}/g, '}')
-      .replace(/,\s*\]/g, ']')
-      .replace(/\n/g, '\\n')
-      .replace(/\r/g, '\\r')
-      .replace(/\t/g, '\\t');
-      
-    // Revert the escaped newlines outside of string values by unescaping structural JSON elements
-    fixedJson = fixedJson.replace(/\\n\s*}/g, '\n}').replace(/\\n\s*\]/g, '\n]').replace(/\\n\s*"/g, '\n"');
-    
     analyticsJson = JSON.parse(dsResultRaw);
-  } catch (e) {
-    console.error("[Background Analytics] JSON Parse Error! Raw output was:");
-    console.error("-----RAW START-----\n" + dsResultRaw + "\n-----RAW END-----");
-    throw new Error("Failed to parse JSON from AI response");
+  } catch (firstErr) {
+    // Try to auto-fix trailing commas and unescaped newlines which are common LLM JSON mistakes
+    try {
+      let fixedJson = dsResultRaw
+        .replace(/,\s*}/g, '}')
+        .replace(/,\s*\]/g, ']')
+        .replace(/\n/g, '\\n')
+        .replace(/\r/g, '\\r')
+        .replace(/\t/g, '\\t');
+
+      // Revert the escaped newlines outside of string values by unescaping structural JSON elements
+      fixedJson = fixedJson.replace(/\\n\s*}/g, '\n}').replace(/\\n\s*\]/g, '\n]').replace(/\\n\s*"/g, '\n"');
+
+      analyticsJson = JSON.parse(fixedJson);
+      console.warn("[Background Analytics] Raw JSON was invalid but auto-fixed version parsed successfully.");
+    } catch (e) {
+      console.error("[Background Analytics] JSON Parse Error! Raw output was:");
+      console.error("-----RAW START-----\n" + dsResultRaw + "\n-----RAW END-----");
+      throw new Error("Failed to parse JSON from AI response");
+    }
   }
 
   // Save the result back to the database, setting status to Completed
@@ -179,58 +185,71 @@ async function runClassAnalyticsInBg(id: string) {
 
   console.log(`[Background Analytics] Completed Class Analytics for assignment ${id}. Now processing Individual Student Analytics...`);
 
-  // 2. Loop through all graded submissions and generate individual student analytics
-  for (const sub of assignment.submissions) {
-    if (sub.analytics) continue; // Skip if already generated (optional, but good for robustness)
-
+  // 2. Generate individual student analytics with bounded parallelism
+  //    (N sequential AI calls was the single biggest wait in this pipeline).
+  const pendingSubs = assignment.submissions.filter(sub => {
+    if (sub.analytics) return false; // Skip if already generated
     const slice = sub.slices[0];
-    if (!slice || !slice.reasoningTree) continue;
+    return !!(slice && slice.reasoningTree);
+  });
 
-    const studentUserPrompt = `
-      Student ID: ${sub.studentId}
-      Total Score: ${slice.aiScore || 0}%
-      
-      Grading Log Data:
-      ${slice.reasoningTree}
-    `;
-
-    const studentSystemPrompt = `
-      You are an elite Educational Analyst.
-      Analyze the provided student grading log for this assignment. 
-      Identify exactly which concepts they did not master.
-      Keep it extremely concise and direct.
-      
-      CRITICAL RULES:
-      1. MUST OUTPUT IN CHINESE (中文). Do not use English in the final JSON values.
-      2. Wrap ALL math formulas in standard LaTeX using single \`$\` (for inline) or double \`$$\` (for block). DO NOT use \\\`\\(\\\` or \\\`\\[\\\`.
-      
-      You MUST output a valid JSON object matching exactly this schema:
-      {
-        "unmasteredConcepts": [
-          {
-            "concept": "String",
-            "mistakeDescription": "String"
-          }
-        ],
-        "suggestions": "String"
-      }
-    `;
-
-    try {
-      console.log(`[Background Analytics] Generating Student Analytics for ${sub.studentId}...`);
-      const studentRaw = await generateReasoning(studentSystemPrompt, studentUserPrompt, true, "deepseek-v4-flash", false, true);
-      if (studentRaw) {
-        const studentJson = JSON.parse(studentRaw);
-        await prisma.submission.update({
-          where: { id: sub.id },
-          data: { analytics: JSON.stringify(studentJson) }
-        });
-      }
-    } catch (err: any) {
-      console.error(`[Background Analytics] Failed to generate student analytics for ${sub.id}:`, err.message);
-      // We don't throw here so we can continue processing other students
+  const studentSystemPrompt = `
+    You are an elite Educational Analyst.
+    Analyze the provided student grading log for this assignment. 
+    Identify exactly which concepts they did not master.
+    Keep it extremely concise and direct.
+    
+    CRITICAL RULES:
+    1. MUST OUTPUT IN CHINESE (中文). Do not use English in the final JSON values.
+    2. Wrap ALL math formulas in standard LaTeX using single \`$\` (for inline) or double \`$$\` (for block). DO NOT use \\\`\\(\\\` or \\\`\\[\\\`.
+    
+    You MUST output a valid JSON object matching exactly this schema:
+    {
+      "unmasteredConcepts": [
+        {
+          "concept": "String",
+          "mistakeDescription": "String"
+        }
+      ],
+      "suggestions": "String"
     }
-  }
+  `;
+
+  const subQueue = [...pendingSubs];
+  const workers = Array.from(
+    { length: Math.min(STUDENT_ANALYTICS_CONCURRENCY, subQueue.length) },
+    async () => {
+      while (subQueue.length > 0) {
+        const sub = subQueue.shift();
+        if (!sub) break;
+
+        const slice = sub.slices[0];
+        const studentUserPrompt = `
+          Student ID: ${sub.studentId}
+          Total Score: ${slice.aiScore || 0}%
+          
+          Grading Log Data:
+          ${slice.reasoningTree}
+        `;
+
+        try {
+          console.log(`[Background Analytics] Generating Student Analytics for ${sub.studentId}...`);
+          const studentRaw = await generateReasoning(studentSystemPrompt, studentUserPrompt, true, "deepseek-v4-flash", false, true);
+          if (studentRaw) {
+            const studentJson = JSON.parse(studentRaw);
+            await prisma.submission.update({
+              where: { id: sub.id },
+              data: { analytics: JSON.stringify(studentJson) }
+            });
+          }
+        } catch (err: any) {
+          console.error(`[Background Analytics] Failed to generate student analytics for ${sub.id}:`, err.message);
+          // We don't throw here so we can continue processing other students
+        }
+      }
+    }
+  );
+  await Promise.all(workers);
 
   console.log(`[Background Analytics] Completed ALL analytics compilation for assignment ${id}.`);
 }

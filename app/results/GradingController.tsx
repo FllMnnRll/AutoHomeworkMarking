@@ -81,13 +81,24 @@ export default function GradingController({
     if (!isActive || pendingCount === 0) return;
 
     let timeoutId: NodeJS.Timeout;
+    let emptyPolls = 0;
     const driveQueue = async () => {
       if (driverRef.current) return;
       driverRef.current = true;
       try {
         const res = await fetch("/api/v1/assignments/process-next", { method: "POST" });
         const data = await res.json();
-        const delay = data.success ? 3000 : 5000;
+        let delay = 5000;
+        if (data.success) {
+          if (data.batchSize === 0) {
+            // Queue is empty: back off exponentially (3s -> 6s -> 12s -> 15s cap)
+            emptyPolls++;
+            delay = Math.min(15000, 3000 * Math.pow(2, emptyPolls));
+          } else {
+            emptyPolls = 0;
+            delay = 3000;
+          }
+        }
         timeoutId = setTimeout(driveQueue, delay);
       } catch (e) {
         console.error("Queue driver error:", e);

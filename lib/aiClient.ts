@@ -33,7 +33,7 @@ function probeLocalPort(port: number): Promise<boolean> {
   });
 }
 
-async function getProxyAgent(): Promise<HttpsProxyAgent<any> | null> {
+async function detectProxyAgent(): Promise<HttpsProxyAgent<any> | null> {
   // 1. If standard environment variables are set, honor them first!
   const envProxy = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
   if (envProxy) {
@@ -42,20 +42,20 @@ async function getProxyAgent(): Promise<HttpsProxyAgent<any> | null> {
     return new HttpsProxyAgent(envProxy);
   }
 
-  // 2. Otherwise, auto-probe common local proxy ports on localhost
-  for (const port of COMMON_PROXY_PORTS) {
-    const isOpen = await probeLocalPort(port);
-    if (isOpen) {
-      const detectedProxyUrl = `http://127.0.0.1:${port}`;
-      console.log(`[ProxyDetector] Auto-detected active local proxy listening on port ${port}! Routing all API traffic through ${detectedProxyUrl}...`);
-      hasActiveProxy = true;
-      
-      // EXTREMELY IMPORTANT: Set environment variables so ALL Node.js global fetches (Gemini SDK, etc) use the proxy!
-      process.env.HTTPS_PROXY = detectedProxyUrl;
-      process.env.HTTP_PROXY = detectedProxyUrl;
-      
-      return new HttpsProxyAgent(detectedProxyUrl);
-    }
+  // 2. Otherwise, auto-probe common local proxy ports on localhost (all in parallel)
+  const probeResults = await Promise.all(COMMON_PROXY_PORTS.map(probeLocalPort));
+  const openIdx = probeResults.findIndex(Boolean);
+  if (openIdx !== -1) {
+    const port = COMMON_PROXY_PORTS[openIdx];
+    const detectedProxyUrl = `http://127.0.0.1:${port}`;
+    console.log(`[ProxyDetector] Auto-detected active local proxy listening on port ${port}! Routing all API traffic through ${detectedProxyUrl}...`);
+    hasActiveProxy = true;
+
+    // EXTREMELY IMPORTANT: Set environment variables so ALL Node.js global fetches (Gemini SDK, etc) use the proxy!
+    process.env.HTTPS_PROXY = detectedProxyUrl;
+    process.env.HTTP_PROXY = detectedProxyUrl;
+
+    return new HttpsProxyAgent(detectedProxyUrl);
   }
 
   console.log(`[ProxyDetector] No active local proxy detected on common ports (${COMMON_PROXY_PORTS.join(', ')}). Using direct connection.`);
@@ -63,10 +63,27 @@ async function getProxyAgent(): Promise<HttpsProxyAgent<any> | null> {
   return null;
 }
 
+// Cache the in-flight detection so concurrent client initializations share one probe.
+let proxyAgentPromise: Promise<HttpsProxyAgent<any> | null> | null = null;
 
-// Pre-create a Standard HTTPS Agent for direct connections
+function getProxyAgent(): Promise<HttpsProxyAgent<any> | null> {
+  if (!proxyAgentPromise) {
+    proxyAgentPromise = detectProxyAgent().catch((err) => {
+      console.warn("[ProxyDetector] Proxy detection failed, using direct connection:", err);
+      proxyAgentPromise = null;
+      return null;
+    });
+  }
+  return proxyAgentPromise;
+}
+
+
+// Pre-create a Standard HTTPS Agent for direct connections.
+// keepAlive reuses TCP/TLS connections across the many sequential OCR/reasoning
+// calls, saving a full TLS handshake (~100-300ms) per request.
 const standardAgent = new https.Agent({
-  keepAlive: false
+  keepAlive: true,
+  maxSockets: 50,
 });
 
 // ==========================================

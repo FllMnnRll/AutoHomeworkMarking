@@ -2,7 +2,7 @@ import React from 'react';
 import Link from 'next/link';
 import { Search, CheckCircle2, AlertTriangle, FileText, Layers } from 'lucide-react';
 import { parseProcessingMeta } from '@/lib/pdfChunking';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '@/lib/prisma';
 import UploadModal from './UploadModal';
 import RetryButton from './RetryButton';
 import GenerateAnalyticsButton from './GenerateAnalyticsButton';
@@ -12,8 +12,6 @@ import AssignmentActions from './AssignmentActions';
 import GradingController from './GradingController';
 
 export const dynamic = 'force-dynamic';
-
-const prisma = new PrismaClient();
 
 export default async function ResultsPage({ searchParams }: { searchParams: Promise<{ assignmentId?: string }> }) {
   const params = await searchParams;
@@ -40,9 +38,10 @@ export default async function ResultsPage({ searchParams }: { searchParams: Prom
     : null;
   const analyticsStatus = classAnalytics ? classAnalytics.status : "None";
 
-  // Fetch all students for the upload dropdown
-  const allStudents = await prisma.student.findMany();
-  const classStudents = activeAssignment ? allStudents.filter(s => s.classId === activeAssignment.classId) : [];
+  // Fetch only the students of the active assignment's class (filtered in SQL)
+  const classStudents = activeAssignment
+    ? await prisma.student.findMany({ where: { classId: activeAssignment.classId } })
+    : [];
 
   const isAnyProcessing = submissions.some(sub => sub.status === 'Processing OCR' || sub.status === 'Queued');
   const totalSubmissions = submissions.length;

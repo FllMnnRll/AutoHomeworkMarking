@@ -1,9 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { PrismaClient } from "@prisma/client";
-import { processHomeworkSlice } from "@/lib/gradingEngine";
+import { prisma } from "@/lib/prisma";
 import { processBatchHomework } from "@/lib/batchGradingEngine";
-
-const prisma = new PrismaClient();
 
 /**
  * Resolve the per-request batch size from the GRADING_CONCURRENCY env var.
@@ -61,35 +58,48 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 3. Atomic lock: flip every selected submission to 'Processing OCR' inside
-    //    a single $transaction. This is the "claim" step that prevents another
-    //    /process-next call (running in parallel) from picking up the same rows.
+    // 3. Atomic claim: flip each selected submission to 'Processing OCR' only
+    //    if it is still 'Queued'. The status guard in the WHERE clause makes
+    //    each claim a true compare-and-swap, so two concurrent /process-next
+    //    calls can never process the same submission twice (the loser's
+    //    updateMany matches 0 rows and the row is dropped from its batch).
     //
-    //    Caveats (intentionally accepted for this task):
-    //      - Two concurrent /process-next calls can both SELECT the same Queued
-    //        rows before either reaches this transaction. The transaction itself
-    //        is serial, so once one wins, the loser's `update` is a no-op (id
-    //        is already in 'Processing OCR') — but the loser has already cached
-    //        the row in `queued` and will still process it. This is a known
-    //        best-effort guard, not a hard mutex. Out of scope for this task.
-    //      - The Submission.errorMessage column is owned by gradingEngine; we
-    //        never touch it from this route.
-    await prisma.$transaction(
-      queued.map((s) =>
-        prisma.submission.update({
-          where: { id: s.id },
-          data: { status: "Processing OCR" },
-        })
-      )
-    );
+    //    Note: the Submission.errorMessage column is owned by gradingEngine;
+    //    we never touch it from this route.
+    const claimed: typeof queued = [];
+    for (const s of queued) {
+      const res = await prisma.submission.updateMany({
+        where: { id: s.id, status: "Queued" },
+        data: { status: "Processing OCR" },
+      });
+      if (res.count > 0) claimed.push(s);
+    }
 
-    // 4. Group by assignment and chunk
-    // Group queued submissions by assignmentId
-    const grouped = queued.reduce((acc, s) => {
+    if (claimed.length === 0) {
+      return NextResponse.json(
+        {
+          success: true,
+          message: "All queued submissions were claimed by another worker",
+          batchSize: 0,
+          results: [],
+        },
+        { status: 200 }
+      );
+    }
+
+    // 4. Group claimed submissions by assignmentId and chunk
+    const grouped = claimed.reduce((acc, s) => {
       if (!acc[s.assignmentId]) acc[s.assignmentId] = [];
       acc[s.assignmentId].push(s);
       return acc;
     }, {} as Record<string, typeof queued>);
+
+    // Single query for all involved assignments (instead of one findUnique per group)
+    const assignmentIds = Object.keys(grouped);
+    const assignments = await prisma.assignment.findMany({
+      where: { id: { in: assignmentIds } },
+    });
+    const assignmentById = new Map(assignments.map((a) => [a.id, a]));
 
     type TaskResult = {
       id: string;
@@ -101,8 +111,7 @@ export async function POST(req: NextRequest) {
     const tasks: Promise<TaskResult>[] = [];
 
     for (const [assignmentId, subs] of Object.entries(grouped)) {
-      // Look up assignment to check depth
-      const assignment = await prisma.assignment.findUnique({ where: { id: assignmentId } });
+      const assignment = assignmentById.get(assignmentId);
       const depth = assignment?.gradingDepth === "Fast" ? 10 : 3;
       
       // Chunk the array
@@ -144,7 +153,7 @@ export async function POST(req: NextRequest) {
     //    success is in the `results` array.
     const response = {
       success: true,
-      batchSize: queued.length,
+      batchSize: claimed.length,
       results: settled.map((r) =>
         r.status === "fulfilled"
           ? r.value
